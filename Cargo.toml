@@ -1,0 +1,32 @@
+[package]
+name = "heimdall"
+version = "0.1.0"
+edition = "2024"
+description = "PTY session supervisor with process-group lifecycle, Unix socket IPC, and pluggable state classification"
+authors = ["Naz Quadri <naz.quadri@gmail.com>"]
+license = "MIT"
+
+[[bin]]
+name = "hm"
+path = "src/main.rs"
+
+[dependencies]
+nix = { version = "0.31", features = ["process", "signal", "term", "fs"] }
+tokio = { version = "1", default-features = false, features = [
+    "rt", "net", "signal", "macros", "sync", "io-util", "io-std", "time",
+] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes = "1"
+anyhow = "1"
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

@@ -1,0 +1,36 @@
+# Heimdall configuration
+# Place as ./heimdall.toml in your project, or ~/.config/heimdall/heimdall.toml globally
+
+# Directory for socket and PID files.
+# socket_dir = "~/.local/share/heimdall/sessions"
+
+# Scrollback buffer size in bytes (replayed to late-joining clients).
+# scrollback_bytes = 65536
+
+# Environment variable name injected into child processes with the session ID.
+# session_env_var = "HEIMDALL_SESSION_ID"
+
+# State classifier: "claude", "simple", or "none".
+#
+#   claude  — full state machine (idle/thinking/streaming/tool_use)
+#             tuned for Claude Code spinner and token output patterns.
+#   simple  — binary idle/active based on silence threshold.
+#   none    — no classification, always reports idle.
+#
+# classifier = "claude"
+
+# Idle detection threshold in milliseconds.
+# idle_threshold_ms = 3000
+
+# State debounce period in milliseconds.
+# Prevents rapid state flickering on ambiguous output.
+# debounce_ms = 200
+
+# Extra environment variables injected into the child process.
+# [[env]]
+# name = "MY_API_KEY"
+# value = "sk-..."
+#
+# [[env]]
+# name = "RUST_LOG"
+# value = "debug"

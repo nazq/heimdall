@@ -1,0 +1,90 @@
+# Heimdall — PTY session supervisor
+# Usage: just <recipe>
+
+# Default: list recipes
+default:
+    @just --list
+
+# ─── Build ─────────────────────────────────────────────────────────
+
+# Build (debug)
+build:
+    cargo build
+
+# Build (release)
+release:
+    cargo build --release
+
+# Install to ~/.local/bin
+install: release
+    cp target/release/hm ~/.local/bin/hm
+    @echo "hm installed to ~/.local/bin/hm"
+
+# ─── Quality ───────────────────────────────────────────────────────
+
+# Run all checks (clippy + fmt check + full test suite)
+check: clippy fmt-check test-all
+
+# Run unit + Rust integration tests
+test *args:
+    cargo test {{ args }}
+
+# Run Python attach tests (requires pexpect)
+test-attach: build
+    python3 tests/test_attach.py
+
+# Run full integration suite (Rust + Python attach tests)
+test-all: test test-attach
+
+# Run tests with coverage (requires cargo-llvm-cov)
+cov:
+    cargo llvm-cov --lcov --output-path lcov.info
+
+# Lint with clippy
+clippy:
+    cargo clippy -- -W clippy::all
+
+# Check formatting
+fmt-check:
+    cargo fmt -- --check
+
+# Format code
+fmt:
+    cargo fmt
+
+# ─── Run ───────────────────────────────────────────────────────────
+
+# Launch a supervised session
+run id +cmd:
+    cargo run -- run --id {{ id }} -- {{ cmd }}
+
+# Attach to a session
+attach id:
+    cargo run -- attach {{ id }}
+
+# List sessions
+ls:
+    cargo run -- ls
+
+# Session status
+status id:
+    cargo run -- status {{ id }}
+
+# Kill a session
+kill id:
+    cargo run -- kill {{ id }}
+
+# ─── Dev ───────────────────────────────────────────────────────────
+
+# Check dependencies
+doctor:
+    @echo "Checking dependencies..."
+    @which cargo >/dev/null 2>&1 && echo "  cargo: $(cargo --version)" || echo "  cargo: MISSING"
+    @which just >/dev/null 2>&1 && echo "  just: $(just --version)" || echo "  just: MISSING"
+    @python3 -c "import pexpect" 2>/dev/null && echo "  pexpect: ok" || echo "  pexpect: MISSING (pip install pexpect — needed for attach tests)"
+    @which cargo-llvm-cov >/dev/null 2>&1 && echo "  cargo-llvm-cov: ok" || echo "  cargo-llvm-cov: MISSING (optional, for coverage)"
+    @echo "Done."
+
+# Clean build artifacts
+clean:
+    cargo clean
