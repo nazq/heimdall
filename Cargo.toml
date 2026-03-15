@@ -1,6 +1,6 @@
 [package]
 name = "heimdall"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 description = "PTY session supervisor with process-group lifecycle, Unix socket IPC, and pluggable state classification"
 authors = ["Naz Quadri <naz.quadri@gmail.com>"]
