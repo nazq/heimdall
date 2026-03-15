@@ -108,6 +108,24 @@ pub fn parse_exit_code(payload: &[u8]) -> io::Result<i32> {
     ]))
 }
 
+/// Map a state byte to a human-readable name.
+///
+/// This is the protocol-level mapping — it knows ALL valid state bytes
+/// regardless of which classifier produced them. Use this instead of
+/// `StateClassifier::state_name` when displaying state to a user who
+/// may not share the session's classifier config.
+pub fn state_name(state: u8) -> &'static str {
+    match state {
+        0x00 => "idle",
+        0x01 => "thinking",
+        0x02 => "streaming",
+        0x03 => "tool_use",
+        0x04 => "active",
+        0xFF => "dead",
+        _ => "unknown",
+    }
+}
+
 /// Maximum frame payload size (1 MB). Frames larger than this are rejected
 /// to prevent OOM from malicious or buggy clients.
 pub const MAX_FRAME_SIZE: usize = 1 << 20;
@@ -647,6 +665,45 @@ mod tests {
     #[test]
     fn parse_exit_code_rejects_oversized() {
         assert!(parse_exit_code(&[0x00, 0x00, 0x00, 0x2A, 0xFF]).is_err());
+    }
+
+    /// All known state bytes map to non-"unknown" names.
+    #[test]
+    fn state_name_known_bytes() {
+        let known: &[(u8, &str)] = &[
+            (0x00, "idle"),
+            (0x01, "thinking"),
+            (0x02, "streaming"),
+            (0x03, "tool_use"),
+            (0x04, "active"),
+            (0xFF, "dead"),
+        ];
+        for &(byte, expected) in known {
+            let name = state_name(byte);
+            assert_eq!(
+                name, expected,
+                "state byte 0x{byte:02x} should be {expected}"
+            );
+            assert_ne!(
+                name, "unknown",
+                "known byte 0x{byte:02x} must not be unknown"
+            );
+        }
+    }
+
+    /// 0xFF maps to "dead".
+    #[test]
+    fn state_name_dead() {
+        assert_eq!(state_name(0xFF), "dead");
+    }
+
+    /// Unknown bytes map to "unknown".
+    #[test]
+    fn state_name_unknown_bytes() {
+        assert_eq!(state_name(0xAB), "unknown");
+        assert_eq!(state_name(0x05), "unknown");
+        assert_eq!(state_name(0x80), "unknown");
+        assert_eq!(state_name(0xFE), "unknown");
     }
 
     /// Dead process golden bytes: alive=0, state=0xFF at correct offsets.

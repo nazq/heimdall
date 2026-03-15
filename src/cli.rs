@@ -144,8 +144,23 @@ impl SessionParams {
     ///
     /// Used by `launch_and_attach` to spawn the supervisor as a background
     /// process with the same resolved parameters.
-    pub fn to_detach_args(&self) -> Vec<String> {
+    /// Write the resolved config to a temp file in `socket_dir` and produce
+    /// CLI arguments for `hm run --detach` re-exec.
+    ///
+    /// This avoids the re-parse boundary: the detached supervisor reads the
+    /// full resolved config (including `[[env]]`, classifier thresholds, etc.)
+    /// instead of reconstructing it from CLI flags.
+    pub fn to_detach_args(&self) -> std::io::Result<Vec<String>> {
+        // Write resolved config to a persistent file the supervisor can read.
+        // Lives in socket_dir alongside .sock/.pid/.log — cleaned up on exit
+        // isn't critical since it's small and the session owns the directory.
+        let config_path = self.socket_dir.join(format!("{}.config.toml", self.id));
+        std::fs::create_dir_all(&self.socket_dir)?;
+        std::fs::write(&config_path, self.cfg.to_toml())?;
+
         let mut args = vec![
+            "--config".into(),
+            config_path.to_string_lossy().into_owned(),
             "run".into(),
             "--id".into(),
             self.id.clone(),
@@ -163,7 +178,7 @@ impl SessionParams {
             "--".into(),
         ];
         args.extend(self.cmd.iter().cloned());
-        args
+        Ok(args)
     }
 }
 
@@ -274,4 +289,279 @@ pub fn merge_run_args(cfg: config::Config, args: RunArgs) -> anyhow::Result<Sess
         cfg,
         log_file: log,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a SessionParams with non-default config.
+    fn make_params(classifier: config::ClassifierConfig) -> SessionParams {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket_dir = tmp.path().to_path_buf();
+        // Leak the TempDir so it lives past the test (config file is written there).
+        std::mem::forget(tmp);
+        let cfg = config::Config {
+            classifier,
+            log_level: "debug".into(),
+            log_filter: Some("tokio=warn,nix=error".into()),
+            scrollback_bytes: 128_000,
+            kill_process_group: false,
+            session_env_var: "MY_SESSION".into(),
+            env: vec![config::EnvVar {
+                name: "FOO".into(),
+                value: "bar".into(),
+            }],
+            ..Default::default()
+        };
+
+        SessionParams {
+            id: "test-sess".into(),
+            workdir: PathBuf::from("/tmp/work"),
+            socket_dir,
+            cols: 200,
+            rows: 40,
+            cmd: vec!["bash".into(), "-c".into(), "echo hi".into()],
+            cfg,
+            log_file: PathBuf::from("/tmp/test.log"),
+        }
+    }
+
+    #[test]
+    fn to_detach_args_writes_config_file() {
+        let p = make_params(config::ClassifierConfig::default());
+        let args = p.to_detach_args().unwrap();
+
+        // Should include --config pointing to a file in socket_dir.
+        let idx = args.iter().position(|a| a == "--config").unwrap();
+        let config_path = PathBuf::from(&args[idx + 1]);
+        assert!(config_path.exists(), "config file should be written");
+
+        // The file should be valid TOML that deserializes back.
+        let contents = std::fs::read_to_string(&config_path).unwrap();
+        let roundtrip: config::Config = toml::from_str(&contents).unwrap();
+        assert_eq!(roundtrip.log_level, "debug");
+        assert_eq!(
+            roundtrip.log_filter.as_deref(),
+            Some("tokio=warn,nix=error")
+        );
+        assert_eq!(roundtrip.scrollback_bytes, 128_000);
+        assert!(!roundtrip.kill_process_group);
+        assert_eq!(roundtrip.session_env_var, "MY_SESSION");
+
+        // env vars round-trip.
+        assert_eq!(roundtrip.env.len(), 1);
+        assert_eq!(roundtrip.env[0].name, "FOO");
+        assert_eq!(roundtrip.env[0].value, "bar");
+    }
+
+    #[test]
+    fn to_detach_args_includes_detach_and_session_params() {
+        let p = make_params(config::ClassifierConfig::default());
+        let args = p.to_detach_args().unwrap();
+
+        assert!(args.contains(&"--detach".to_string()));
+        assert!(args.contains(&"--id".to_string()));
+        assert!(args.contains(&"test-sess".to_string()));
+
+        let sep = args.iter().position(|a| a == "--").unwrap();
+        assert_eq!(&args[sep + 1..], &["bash", "-c", "echo hi"]);
+    }
+
+    #[test]
+    fn to_detach_args_config_roundtrip_claude_classifier() {
+        let p = make_params(config::ClassifierConfig::Claude {
+            idle_threshold_ms: 5000,
+            debounce_ms: 200,
+        });
+        let args = p.to_detach_args().unwrap();
+
+        let idx = args.iter().position(|a| a == "--config").unwrap();
+        let contents = std::fs::read_to_string(&args[idx + 1]).unwrap();
+        let roundtrip: config::Config = toml::from_str(&contents).unwrap();
+
+        assert_eq!(roundtrip.classifier.name(), "claude");
+        assert_eq!(roundtrip.classifier.idle_threshold_ms(), 5000);
+        assert_eq!(roundtrip.classifier.debounce_ms(), 200);
+    }
+
+    #[test]
+    fn to_detach_args_config_roundtrip_none_classifier() {
+        let p = make_params(config::ClassifierConfig::None);
+        let args = p.to_detach_args().unwrap();
+
+        let idx = args.iter().position(|a| a == "--config").unwrap();
+        let contents = std::fs::read_to_string(&args[idx + 1]).unwrap();
+        let roundtrip: config::Config = toml::from_str(&contents).unwrap();
+
+        assert_eq!(roundtrip.classifier.name(), "none");
+    }
+
+    // ── merge_run_args tests ─────────────────────────────────────────
+
+    #[test]
+    fn merge_cli_overrides_config() {
+        let cfg = config::Config::default();
+        let args = RunArgs {
+            id: "test".into(),
+            workdir: PathBuf::from("."),
+            socket_dir: None,
+            cols: 80,
+            rows: 24,
+            log_file: None,
+            log_level: Some("debug".into()),
+            log_filter: Some("tokio=warn".into()),
+            scrollback_bytes: Some(256_000),
+            classifier: None,
+            idle_threshold_ms: None,
+            debounce_ms: None,
+            kill_process_group: Some(false),
+            session_env_var: Some("CUSTOM_VAR".into()),
+            cmd: vec!["bash".into()],
+        };
+        let params = merge_run_args(cfg, args).unwrap();
+        assert_eq!(params.cfg.log_level, "debug");
+        assert_eq!(params.cfg.log_filter.as_deref(), Some("tokio=warn"));
+        assert_eq!(params.cfg.scrollback_bytes, 256_000);
+        assert!(!params.cfg.kill_process_group);
+        assert_eq!(params.cfg.session_env_var, "CUSTOM_VAR");
+    }
+
+    #[test]
+    fn merge_config_defaults_preserved() {
+        let cfg = config::Config::default();
+        let args = RunArgs {
+            id: "test".into(),
+            workdir: PathBuf::from("."),
+            socket_dir: None,
+            cols: 80,
+            rows: 24,
+            log_file: None,
+            log_level: None,
+            log_filter: None,
+            scrollback_bytes: None,
+            classifier: None,
+            idle_threshold_ms: None,
+            debounce_ms: None,
+            kill_process_group: None,
+            session_env_var: None,
+            cmd: vec!["bash".into()],
+        };
+        let params = merge_run_args(cfg, args).unwrap();
+        assert_eq!(params.cfg.log_level, config::DEFAULT_LOG_LEVEL);
+        assert!(params.cfg.log_filter.is_none());
+        assert_eq!(params.cfg.scrollback_bytes, 64 * 1024);
+        assert!(params.cfg.kill_process_group);
+        assert_eq!(params.cfg.session_env_var, "HEIMDALL_SESSION_ID");
+    }
+
+    #[test]
+    fn merge_classifier_switch_resets_defaults() {
+        let cfg = config::Config {
+            classifier: config::ClassifierConfig::Simple {
+                idle_threshold_ms: 9999,
+            },
+            ..Default::default()
+        };
+        let args = RunArgs {
+            id: "test".into(),
+            workdir: PathBuf::from("."),
+            socket_dir: None,
+            cols: 80,
+            rows: 24,
+            log_file: None,
+            log_level: None,
+            log_filter: None,
+            scrollback_bytes: None,
+            classifier: Some("claude".into()),
+            idle_threshold_ms: None,
+            debounce_ms: None,
+            kill_process_group: None,
+            session_env_var: None,
+            cmd: vec!["bash".into()],
+        };
+        let params = merge_run_args(cfg, args).unwrap();
+        // Switching classifier resets to that classifier's defaults.
+        assert_eq!(params.cfg.classifier.name(), "claude");
+        assert_eq!(
+            params.cfg.classifier.idle_threshold_ms(),
+            config::DEFAULT_IDLE_THRESHOLD_MS
+        );
+        assert_eq!(
+            params.cfg.classifier.debounce_ms(),
+            config::DEFAULT_DEBOUNCE_MS
+        );
+    }
+
+    #[test]
+    fn merge_classifier_switch_with_overrides() {
+        let cfg = config::Config::default();
+        let args = RunArgs {
+            id: "test".into(),
+            workdir: PathBuf::from("."),
+            socket_dir: None,
+            cols: 80,
+            rows: 24,
+            log_file: None,
+            log_level: None,
+            log_filter: None,
+            scrollback_bytes: None,
+            classifier: Some("claude".into()),
+            idle_threshold_ms: Some(5000),
+            debounce_ms: Some(200),
+            kill_process_group: None,
+            session_env_var: None,
+            cmd: vec!["bash".into()],
+        };
+        let params = merge_run_args(cfg, args).unwrap();
+        assert_eq!(params.cfg.classifier.idle_threshold_ms(), 5000);
+        assert_eq!(params.cfg.classifier.debounce_ms(), 200);
+    }
+
+    #[test]
+    fn merge_log_file_default_derived_from_socket_dir() {
+        let cfg = config::Config::default();
+        let args = RunArgs {
+            id: "my-session".into(),
+            workdir: PathBuf::from("."),
+            socket_dir: Some(PathBuf::from("/tmp/socks")),
+            cols: 80,
+            rows: 24,
+            log_file: None,
+            log_level: None,
+            log_filter: None,
+            scrollback_bytes: None,
+            classifier: None,
+            idle_threshold_ms: None,
+            debounce_ms: None,
+            kill_process_group: None,
+            session_env_var: None,
+            cmd: vec!["bash".into()],
+        };
+        let params = merge_run_args(cfg, args).unwrap();
+        assert_eq!(params.log_file, PathBuf::from("/tmp/socks/my-session.log"));
+    }
+
+    #[test]
+    fn merge_unknown_classifier_errors() {
+        let cfg = config::Config::default();
+        let args = RunArgs {
+            id: "test".into(),
+            workdir: PathBuf::from("."),
+            socket_dir: None,
+            cols: 80,
+            rows: 24,
+            log_file: None,
+            log_level: None,
+            log_filter: None,
+            scrollback_bytes: None,
+            classifier: Some("bogus".into()),
+            idle_threshold_ms: None,
+            debounce_ms: None,
+            kill_process_group: None,
+            session_env_var: None,
+            cmd: vec!["bash".into()],
+        };
+        assert!(merge_run_args(cfg, args).is_err());
+    }
 }

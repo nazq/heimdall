@@ -6,7 +6,7 @@
 //! 3. `~/.config/heimdall/heimdall.toml`
 //! 4. Built-in defaults
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Default log level for the supervisor.
@@ -16,7 +16,7 @@ pub const DEFAULT_LOG_LEVEL: &str = "info";
 pub const DEFAULT_DETACH_KEY: u8 = 0x1C;
 
 /// Root configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
     /// Directory for socket and PID files.
@@ -65,6 +65,13 @@ impl Default for Config {
             detach_key: DEFAULT_DETACH_KEY,
             env: Vec::new(),
         }
+    }
+}
+
+impl Config {
+    /// Serialize the resolved config to TOML for re-exec.
+    pub fn to_toml(&self) -> String {
+        toml::to_string(self).expect("Config serialization should never fail")
     }
 }
 
@@ -127,12 +134,57 @@ impl ClassifierConfig {
     }
 
     /// The classifier type name as a string.
+    #[cfg(test)]
     pub fn name(&self) -> &'static str {
         match self {
             Self::Claude { .. } => "claude",
             Self::Simple { .. } => "simple",
             Self::None => "none",
         }
+    }
+}
+
+impl Serialize for ClassifierConfig {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        // Serialize as `{ "<name>": { params... } }` which the ClassifierRaw
+        // table form deserializer accepts.
+        let mut map = serializer.serialize_map(Some(1))?;
+        match self {
+            Self::Claude {
+                idle_threshold_ms,
+                debounce_ms,
+            } => {
+                #[derive(Serialize)]
+                struct Params {
+                    idle_threshold_ms: u64,
+                    debounce_ms: u64,
+                }
+                map.serialize_entry(
+                    "claude",
+                    &Params {
+                        idle_threshold_ms: *idle_threshold_ms,
+                        debounce_ms: *debounce_ms,
+                    },
+                )?;
+            }
+            Self::Simple { idle_threshold_ms } => {
+                #[derive(Serialize)]
+                struct Params {
+                    idle_threshold_ms: u64,
+                }
+                map.serialize_entry(
+                    "simple",
+                    &Params {
+                        idle_threshold_ms: *idle_threshold_ms,
+                    },
+                )?;
+            }
+            Self::None => {
+                map.serialize_entry("none", &std::collections::HashMap::<String, String>::new())?;
+            }
+        }
+        map.end()
     }
 }
 
@@ -244,7 +296,7 @@ impl TryFrom<ClassifierRaw> for ClassifierConfig {
 }
 
 /// An extra environment variable to inject into the child.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EnvVar {
     pub name: String,
     pub value: String,

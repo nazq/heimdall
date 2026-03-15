@@ -9,7 +9,7 @@ Fork. Watch. Control. From anywhere.
 *Named for the Norse guardian who watches over Bifrost — Heimdall sees all, hears all, and nothing escapes on his watch.*
 
 [![CI](https://github.com/nazq/heimdall/actions/workflows/ci.yml/badge.svg)](https://github.com/nazq/heimdall/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/nazq/heimdall/graph/badge.svg)](https://codecov.io/gh/nazq/heimdall)
+[![codecov](https://codecov.io/gh/nazq/heimdall/graph/badge.svg?token=opgTAX2W8k)](https://codecov.io/gh/nazq/heimdall)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024_edition-orange.svg)](https://www.rust-lang.org/)
 

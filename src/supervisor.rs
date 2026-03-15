@@ -64,7 +64,7 @@ fn proc_cmdline(proc: &Path) -> Option<String> {
 }
 
 /// Format seconds into a human-readable uptime string.
-fn format_uptime(secs: u64) -> String {
+pub(crate) fn format_uptime(secs: u64) -> String {
     let days = secs / 86400;
     let hours = (secs % 86400) / 3600;
     let mins = (secs % 3600) / 60;
@@ -121,17 +121,21 @@ fn die_session_locked(id: &str, pid_path: &Path) -> ! {
     std::process::exit(1);
 }
 
-/// RAII guard that removes socket and PID files on drop.
+/// RAII guard that removes session files on drop.
 /// Ensures cleanup even on panic or early `?` return.
 struct CleanupGuard {
     socket_path: PathBuf,
     pid_path: PathBuf,
+    config_path: PathBuf,
 }
 
 impl Drop for CleanupGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.socket_path);
         let _ = std::fs::remove_file(&self.pid_path);
+        // Ephemeral config file written by to_detach_args() for re-exec.
+        // May contain secrets from [[env]]. Clean up silently.
+        let _ = std::fs::remove_file(&self.config_path);
     }
 }
 
@@ -218,10 +222,11 @@ pub fn supervise(params: SessionParams) -> anyhow::Result<()> {
         crate::pidfile::PidFile::write_child(f, child_pid.as_raw())?;
     }
 
-    // RAII cleanup — removes socket + PID on drop (panic, early return, normal exit).
+    // RAII cleanup — removes socket + PID + ephemeral config on drop.
     let _cleanup = CleanupGuard {
         socket_path: socket_path.clone(),
         pid_path: pid_path.clone(),
+        config_path: socket_dir.join(format!("{id}.config.toml")),
     };
 
     // Log to file, never to stderr (which would corrupt the terminal or
@@ -418,4 +423,44 @@ async fn event_loop(
     tracing::info!(exit_code, "supervisor exiting");
 
     Ok(exit_code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_uptime_zero_seconds() {
+        assert_eq!(format_uptime(0), "uptime 0m");
+    }
+
+    #[test]
+    fn format_uptime_under_one_minute() {
+        assert_eq!(format_uptime(59), "uptime 0m");
+    }
+
+    #[test]
+    fn format_uptime_exactly_one_minute() {
+        assert_eq!(format_uptime(60), "uptime 1m");
+    }
+
+    #[test]
+    fn format_uptime_exactly_one_hour() {
+        assert_eq!(format_uptime(3600), "uptime 1h 0m");
+    }
+
+    #[test]
+    fn format_uptime_one_hour_one_minute_one_second() {
+        assert_eq!(format_uptime(3661), "uptime 1h 1m");
+    }
+
+    #[test]
+    fn format_uptime_exactly_one_day() {
+        assert_eq!(format_uptime(86400), "uptime 1d 0h");
+    }
+
+    #[test]
+    fn format_uptime_one_day_one_hour() {
+        assert_eq!(format_uptime(90061), "uptime 1d 1h");
+    }
 }

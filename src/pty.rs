@@ -3,7 +3,7 @@
 //! The supervisor owns the master fd. The child gets the slave on
 //! stdin/stdout/stderr via the pre-exec seam.
 
-use crate::config::Config;
+use crate::config::{Config, EnvVar};
 use nix::libc;
 use nix::pty::{OpenptyResult, openpty};
 use nix::sys::signal::{self, SigHandler, Signal};
@@ -18,6 +18,47 @@ pub struct PtyChild {
     pub master: OwnedFd,
     /// Child PID.
     pub pid: Pid,
+}
+
+/// Convert a command slice into `CString`s suitable for `execvp`.
+///
+/// Validates that no argument contains interior NUL bytes. This must run
+/// before `fork()` — `CString::new` can allocate and panic, and a panic
+/// in the child after fork is catastrophic.
+pub fn prepare_argv(cmd: &[String]) -> io::Result<Vec<CString>> {
+    cmd.iter()
+        .map(|s| CString::new(s.as_str()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
+}
+
+/// Build the list of `(key, value)` pairs that will be injected into the
+/// child's environment. Pure computation — no side effects.
+///
+/// Returns the session env var first, followed by any extra vars from config.
+pub fn prepare_env<'a>(
+    session_env_var: &'a str,
+    session_id: &'a str,
+    extra: &'a [EnvVar],
+) -> Vec<(&'a str, &'a str)> {
+    let mut pairs = Vec::with_capacity(1 + extra.len());
+    pairs.push((session_env_var, session_id));
+    for var in extra {
+        pairs.push((var.name.as_str(), var.value.as_str()));
+    }
+    pairs
+}
+
+/// Compute the signal target PID.
+///
+/// When `kill_group` is true, returns the negated PID which tells `kill(2)`
+/// to signal the entire process group. Otherwise returns the PID unchanged.
+pub fn signal_target(pid: Pid, kill_group: bool) -> Pid {
+    if kill_group {
+        Pid::from_raw(-pid.as_raw())
+    } else {
+        pid
+    }
 }
 
 /// Open a pty, fork, and exec the command in the child.
@@ -37,11 +78,7 @@ pub fn spawn(
     // Build CStrings BEFORE fork — CString::new can panic on NUL bytes,
     // and a panic in the child after fork is catastrophic (runs panic handler,
     // allocates, corrupts parent state).
-    let c_cmd: Vec<CString> = cmd
-        .iter()
-        .map(|s| CString::new(s.as_str()))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let c_cmd = prepare_argv(cmd)?;
 
     // Build winsize for atomic openpty setup.
     let ws = Some(libc::winsize {
@@ -123,12 +160,13 @@ pub fn spawn(
                 reset_signal_dispositions();
             }
 
-            // Set session ID environment variable (configurable name)
-            unsafe { env::set_var(&config.session_env_var, session_id) };
-
-            // Set extra environment variables from config
-            for var in &config.env {
-                unsafe { env::set_var(&var.name, &var.value) };
+            // Set environment variables (session ID + extras from config).
+            // prepare_env was called before fork to keep allocation out of
+            // the post-fork child, but the slices borrow from pre-fork data
+            // which is still valid (fork copies the address space).
+            let env_pairs = prepare_env(&config.session_env_var, session_id, &config.env);
+            for (k, v) in &env_pairs {
+                unsafe { env::set_var(k, v) };
             }
 
             // Change working directory
@@ -192,22 +230,12 @@ pub fn send_sigwinch(pid: Pid) -> io::Result<()> {
 
 /// Send SIGTERM, targeting the process group or direct child based on config.
 pub fn send_sigterm(pid: Pid, kill_group: bool) -> io::Result<()> {
-    let target = if kill_group {
-        Pid::from_raw(-pid.as_raw())
-    } else {
-        pid
-    };
-    signal::kill(target, Signal::SIGTERM).map_err(nix_to_io)
+    signal::kill(signal_target(pid, kill_group), Signal::SIGTERM).map_err(nix_to_io)
 }
 
 /// Send SIGKILL, targeting the process group or direct child based on config.
 pub fn send_sigkill(pid: Pid, kill_group: bool) -> io::Result<()> {
-    let target = if kill_group {
-        Pid::from_raw(-pid.as_raw())
-    } else {
-        pid
-    };
-    signal::kill(target, Signal::SIGKILL).map_err(nix_to_io)
+    signal::kill(signal_target(pid, kill_group), Signal::SIGKILL).map_err(nix_to_io)
 }
 
 /// Wait for a child process, returning the exit code.
@@ -327,4 +355,142 @@ unsafe fn close_inherited_fds() {
 
 fn nix_to_io(e: nix::Error) -> io::Error {
     io::Error::from_raw_os_error(e as i32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- prepare_argv --
+
+    #[test]
+    fn prepare_argv_simple_command() {
+        let cmd: Vec<String> = vec!["bash".into(), "-c".into(), "echo hello".into()];
+        let result = prepare_argv(&cmd).unwrap();
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].to_str().unwrap(), "bash");
+        assert_eq!(result[1].to_str().unwrap(), "-c");
+        assert_eq!(result[2].to_str().unwrap(), "echo hello");
+    }
+
+    #[test]
+    fn prepare_argv_single_element() {
+        let cmd: Vec<String> = vec!["sleep".into()];
+        let result = prepare_argv(&cmd).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].to_str().unwrap(), "sleep");
+    }
+
+    #[test]
+    fn prepare_argv_empty_string_arg() {
+        let cmd: Vec<String> = vec!["cmd".into(), "".into()];
+        let result = prepare_argv(&cmd).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[1].to_str().unwrap(), "");
+    }
+
+    #[test]
+    fn prepare_argv_interior_nul_is_error() {
+        let cmd: Vec<String> = vec!["bash".into(), "hello\0world".into()];
+        let result = prepare_argv(&cmd);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn prepare_argv_nul_in_first_arg_is_error() {
+        let cmd: Vec<String> = vec!["\0".into()];
+        let result = prepare_argv(&cmd);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn prepare_argv_unicode_args() {
+        let cmd: Vec<String> = vec!["echo".into(), "héllo".into(), "世界".into()];
+        let result = prepare_argv(&cmd).unwrap();
+        assert_eq!(result[1].to_str().unwrap(), "héllo");
+        assert_eq!(result[2].to_str().unwrap(), "世界");
+    }
+
+    #[test]
+    fn prepare_argv_preserves_spaces_and_special_chars() {
+        let cmd: Vec<String> = vec![
+            "cmd".into(),
+            "--flag=value with spaces".into(),
+            "$VAR".into(),
+        ];
+        let result = prepare_argv(&cmd).unwrap();
+        assert_eq!(result[1].to_str().unwrap(), "--flag=value with spaces");
+        assert_eq!(result[2].to_str().unwrap(), "$VAR");
+    }
+
+    // -- prepare_env --
+
+    #[test]
+    fn prepare_env_session_only() {
+        let pairs = prepare_env("MY_SESSION", "sess-42", &[]);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0], ("MY_SESSION", "sess-42"));
+    }
+
+    #[test]
+    fn prepare_env_with_extras() {
+        let extras = vec![
+            EnvVar {
+                name: "FOO".into(),
+                value: "bar".into(),
+            },
+            EnvVar {
+                name: "BAZ".into(),
+                value: "qux".into(),
+            },
+        ];
+        let pairs = prepare_env("HEIMDALL_SESSION_ID", "test-1", &extras);
+        assert_eq!(pairs.len(), 3);
+        assert_eq!(pairs[0], ("HEIMDALL_SESSION_ID", "test-1"));
+        assert_eq!(pairs[1], ("FOO", "bar"));
+        assert_eq!(pairs[2], ("BAZ", "qux"));
+    }
+
+    #[test]
+    fn prepare_env_ordering_is_session_first() {
+        let extras = vec![EnvVar {
+            name: "FIRST".into(),
+            value: "1".into(),
+        }];
+        let pairs = prepare_env("SESSION", "id", &extras);
+        // Session var is always first — child can rely on this ordering.
+        assert_eq!(pairs[0].0, "SESSION");
+        assert_eq!(pairs[1].0, "FIRST");
+    }
+
+    // -- signal_target --
+
+    #[test]
+    fn signal_target_group_negates_pid() {
+        let pid = Pid::from_raw(12345);
+        let target = signal_target(pid, true);
+        assert_eq!(target.as_raw(), -12345);
+    }
+
+    #[test]
+    fn signal_target_direct_preserves_pid() {
+        let pid = Pid::from_raw(12345);
+        let target = signal_target(pid, false);
+        assert_eq!(target.as_raw(), 12345);
+    }
+
+    #[test]
+    fn signal_target_pid_1_group() {
+        let pid = Pid::from_raw(1);
+        let target = signal_target(pid, true);
+        assert_eq!(target.as_raw(), -1);
+    }
+
+    #[test]
+    fn signal_target_pid_1_direct() {
+        let pid = Pid::from_raw(1);
+        let target = signal_target(pid, false);
+        assert_eq!(target.as_raw(), 1);
+    }
 }
