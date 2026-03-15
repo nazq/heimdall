@@ -61,7 +61,10 @@ impl StateClassifier for SimpleClassifier {
         self.current_state = ProcessState::Dead;
         self.state_entered_at = now_ms;
     }
+}
 
+#[cfg(test)]
+impl SimpleClassifier {
     fn state_name(&self, state: u8) -> &'static str {
         match state {
             0x00 => "idle",

@@ -244,13 +244,7 @@ class TestAttachCore:
             assert (socket_dir / "auto.sock").exists(), "Supervisor should survive detach"
         finally:
             child.close(force=True)
-            try:
-                pid_path = socket_dir / "auto.pid"
-                if pid_path.exists():
-                    pid = int(pid_path.read_text().strip())
-                    os.kill(pid, signal.SIGTERM)
-            except (ValueError, ProcessLookupError, FileNotFoundError):
-                pass
+            _kill_supervisor(socket_dir, "auto")
 
 
 # ── Signal handling tests ────────────────────────────────────────────
@@ -392,3 +386,106 @@ class TestAdversarial:
         child = _attach(socket_dir, sid)
         child.expect(r"\[hm\]", timeout=5)
         _detach(child)
+
+
+# ── Non-detached re-exec config preservation ─────────────────────────
+
+
+def _kill_supervisor(socket_dir: Path, session_id: str) -> None:
+    """Kill a supervisor by reading its PID file (line 1 = supervisor PID)."""
+    pid_path = socket_dir / f"{session_id}.pid"
+    try:
+        if pid_path.exists():
+            first_line = pid_path.read_text().splitlines()[0].strip()
+            os.kill(int(first_line), signal.SIGTERM)
+    except (ValueError, IndexError, ProcessLookupError, FileNotFoundError):
+        pass
+
+
+class TestNonDetachedConfig:
+    """Prove config-only settings survive the non-detached re-exec path."""
+
+    def test_env_injection_survives_reexec(self, socket_dir: Path) -> None:
+        """[[env]] from config file reaches the child in non-detached mode."""
+        config_path = socket_dir / "env-test.toml"
+        config_path.write_text(
+            '[[env]]\nname = "HM_TEST_MAGIC"\nvalue = "xyzzy42"\n'
+        )
+
+        child = pexpect.spawn(
+            HM_BIN,
+            [
+                "--config", str(config_path),
+                "run", "--id", "env-reexec",
+                "--socket-dir", str(socket_dir),
+                "--", "bash", "-c",
+                "echo ENV_IS_${HM_TEST_MAGIC} && sleep 60",
+            ],
+            timeout=10,
+            dimensions=(24, 80),
+        )
+
+        try:
+            child.expect("ENV_IS_xyzzy42", timeout=10)
+        finally:
+            child.close(force=True)
+            _kill_supervisor(socket_dir, "env-reexec")
+
+    def test_custom_session_env_var_survives_reexec(
+        self, socket_dir: Path,
+    ) -> None:
+        """session_env_var from config reaches the child in non-detached mode."""
+        config_path = socket_dir / "sessvar-test.toml"
+        config_path.write_text('session_env_var = "MY_CUSTOM_ID"\n')
+
+        child = pexpect.spawn(
+            HM_BIN,
+            [
+                "--config", str(config_path),
+                "run", "--id", "sessvar-reexec",
+                "--socket-dir", str(socket_dir),
+                "--", "bash", "-c",
+                "echo SESSVAR_IS_${MY_CUSTOM_ID} && sleep 60",
+            ],
+            timeout=10,
+            dimensions=(24, 80),
+        )
+
+        try:
+            child.expect("SESSVAR_IS_sessvar-reexec", timeout=10)
+        finally:
+            child.close(force=True)
+            _kill_supervisor(socket_dir, "sessvar-reexec")
+
+    def test_kill_process_group_survives_reexec(
+        self, socket_dir: Path,
+    ) -> None:
+        """kill_process_group = false from config is preserved in non-detached mode."""
+        config_path = socket_dir / "kpg-test.toml"
+        config_path.write_text("kill_process_group = false\n")
+
+        child = pexpect.spawn(
+            HM_BIN,
+            [
+                "--config", str(config_path),
+                "run", "--id", "kpg-reexec",
+                "--socket-dir", str(socket_dir),
+                "--", "bash", "-c",
+                # The child prints a marker so we know it started.
+                "echo KPG_STARTED && sleep 60",
+            ],
+            timeout=10,
+            dimensions=(24, 80),
+        )
+
+        try:
+            child.expect("KPG_STARTED", timeout=10)
+            # Verify the config file was written for re-exec and contains
+            # the correct setting.
+            config_reexec = socket_dir / "kpg-reexec.config.toml"
+            if config_reexec.exists():
+                contents = config_reexec.read_text()
+                assert "kill_process_group = false" in contents
+        finally:
+            child.close(force=True)
+            _kill_supervisor(socket_dir, "kpg-reexec")

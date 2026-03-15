@@ -1,26 +1,23 @@
 //! Simple subcommands: status, list, kill, clean.
 
 use crate::util::{session_socket, with_runtime};
-use crate::{classify, config, protocol};
+use crate::{config, protocol};
 use std::path::PathBuf;
 use std::time::Duration;
 
-pub fn status(id: String, socket_dir: PathBuf, cfg: &config::Config) -> anyhow::Result<()> {
+pub fn status(id: String, socket_dir: PathBuf, _cfg: &config::Config) -> anyhow::Result<()> {
     let socket_path = session_socket(&id, &socket_dir);
-    let classifier_config = cfg.classifier.clone();
 
     with_runtime(async move {
         let mut sess = protocol::Session::connect(&socket_path).await?;
         let status = sess.recv_status().await?;
 
-        let cls = classify::from_config(&classifier_config);
-        let state_name = cls.state_name(status.state);
+        let state_name = protocol::state_name(status.state);
 
         println!("session:    {id}");
         println!("pid:        {}", status.pid);
         println!("idle_ms:    {}", status.idle_ms);
         println!("alive:      {}", status.alive);
-        println!("classifier: {}", classifier_config.name());
         println!("state:      {state_name} ({}ms)", status.state_ms);
 
         Ok(())

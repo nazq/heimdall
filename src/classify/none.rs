@@ -20,7 +20,10 @@ impl StateClassifier for NoneClassifier {
     }
 
     fn set_dead(&mut self, _now_ms: u64) {}
+}
 
+#[cfg(test)]
+impl NoneClassifier {
     fn state_name(&self, state: u8) -> &'static str {
         match state {
             0xFF => "dead",

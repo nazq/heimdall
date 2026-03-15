@@ -61,7 +61,7 @@ pub fn terminal_size() -> std::io::Result<(u16, u16)> {
 /// Callers should use this for pty RESIZE frames so the child sees the
 /// correct usable height.
 pub async fn setup_status_bar(
-    stdout: &mut tokio::io::Stdout,
+    stdout: &mut (impl AsyncWriteExt + Unpin),
     session_id: &str,
     cols: u16,
     rows: u16,
@@ -84,7 +84,7 @@ pub async fn setup_status_bar(
 ///
 /// Returns the inner row count for the RESIZE frame.
 pub async fn resize_status_bar(
-    stdout: &mut tokio::io::Stdout,
+    stdout: &mut (impl AsyncWriteExt + Unpin),
     session_id: &str,
     cols: u16,
     rows: u16,
@@ -109,7 +109,7 @@ pub async fn resize_status_bar(
 /// Uses a single pre-sized buffer and `write!` to minimize allocations.
 /// This runs every second for status bar updates.
 pub async fn draw_status_bar(
-    stdout: &mut tokio::io::Stdout,
+    stdout: &mut (impl AsyncWriteExt + Unpin),
     session_id: &str,
     cols: u16,
     rows: u16,
@@ -190,7 +190,7 @@ fn digit_count(n: u32) -> usize {
 }
 
 /// Reset scroll region and switch back to the main screen buffer.
-pub async fn reset_scroll_region(stdout: &mut tokio::io::Stdout) -> std::io::Result<()> {
+pub async fn reset_scroll_region(stdout: &mut (impl AsyncWriteExt + Unpin)) -> std::io::Result<()> {
     stdout.write_all(SCROLL_REGION_RESET.as_bytes()).await?;
     stdout.write_all(ALT_SCREEN_OFF.as_bytes()).await?;
     stdout.flush().await?;
@@ -207,5 +207,233 @@ impl Drop for RestoreTermios {
     fn drop(&mut self) {
         let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
         let _ = termios::tcsetattr(fd, termios::SetArg::TCSANOW, &self.original);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- digit_count --
+
+    #[test]
+    fn digit_count_zero() {
+        assert_eq!(digit_count(0), 1);
+    }
+
+    #[test]
+    fn digit_count_single_digit() {
+        assert_eq!(digit_count(9), 1);
+    }
+
+    #[test]
+    fn digit_count_multi_digit() {
+        assert_eq!(digit_count(10), 2);
+        assert_eq!(digit_count(999), 3);
+        assert_eq!(digit_count(1000), 4);
+        assert_eq!(digit_count(u32::MAX), 10);
+    }
+
+    // -- state_byte → color/name rendering via real draw_status_bar --
+
+    #[tokio::test]
+    async fn state_rendering_known_states() {
+        let cases: &[(u8, &str, &str)] = &[
+            (0x00, "idle", GREEN_BG_BLACK_FG),
+            (0x01, "thinking", YELLOW_BG_BLACK_FG),
+            (0x02, "streaming", BLUE_BG_WHITE_FG),
+            (0x03, "tool_use", MAGENTA_BG_WHITE_FG),
+            (0x04, "active", CYAN_BG_BLACK_FG),
+            (0xFF, "dead", RED_BG_WHITE_FG),
+        ];
+        for &(byte, expected_name, expected_color) in cases {
+            let info = StatusInfo {
+                state_byte: byte,
+                state_ms: 0,
+            };
+            let bar = render_bar("s", 80, 24, Some(&info)).await;
+            assert!(
+                bar.contains(expected_name),
+                "state 0x{byte:02X} should render as {expected_name}, got: {bar:?}"
+            );
+            assert!(
+                bar.contains(expected_color),
+                "state 0x{byte:02X} should use correct color"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn state_rendering_unknown_byte() {
+        let info = StatusInfo {
+            state_byte: 0x42,
+            state_ms: 0,
+        };
+        let bar = render_bar("s", 80, 24, Some(&info)).await;
+        assert!(bar.contains("unknown"));
+        assert!(bar.contains(WHITE_BG_BLACK_FG));
+    }
+
+    #[tokio::test]
+    async fn state_rendering_none_info() {
+        let bar = render_bar("s", 80, 24, None).await;
+        assert!(bar.contains("..."));
+        assert!(bar.contains(GRAY_BG_WHITE_FG));
+    }
+
+    // -- status bar content tests (async) --
+    // These call the real rendering functions via a Vec<u8> writer.
+
+    /// Helper: call the real `draw_status_bar` into a byte buffer.
+    async fn render_bar(
+        session_id: &str,
+        cols: u16,
+        rows: u16,
+        info: Option<&StatusInfo>,
+    ) -> String {
+        let mut buf = Vec::new();
+        draw_status_bar(&mut buf, session_id, cols, rows, info)
+            .await
+            .unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    #[tokio::test]
+    async fn bar_contains_session_id() {
+        let bar = render_bar("my-session", 80, 24, None).await;
+        assert!(bar.contains("my-session"), "bar should contain session id");
+    }
+
+    #[tokio::test]
+    async fn bar_contains_hm_prefix() {
+        let bar = render_bar("test", 80, 24, None).await;
+        assert!(bar.contains("[hm]"), "bar should contain [hm] prefix");
+    }
+
+    #[tokio::test]
+    async fn bar_contains_state_name() {
+        let info = StatusInfo {
+            state_byte: 0x01,
+            state_ms: 5000,
+        };
+        let bar = render_bar("s1", 80, 24, Some(&info)).await;
+        assert!(bar.contains("thinking"), "bar should contain state name");
+    }
+
+    #[tokio::test]
+    async fn bar_contains_duration_seconds() {
+        let info = StatusInfo {
+            state_byte: 0x00,
+            state_ms: 42_000,
+        };
+        let bar = render_bar("s1", 80, 24, Some(&info)).await;
+        assert!(bar.contains("42s"), "bar should show 42s duration");
+    }
+
+    #[tokio::test]
+    async fn bar_contains_duration_minutes() {
+        let info = StatusInfo {
+            state_byte: 0x00,
+            state_ms: 125_000,
+        };
+        let bar = render_bar("s1", 80, 24, Some(&info)).await;
+        assert!(bar.contains("2m5s"), "bar should show 2m5s duration");
+    }
+
+    #[tokio::test]
+    async fn bar_with_empty_session_name() {
+        let bar = render_bar("", 80, 24, None).await;
+        assert!(
+            bar.contains("[hm]"),
+            "bar should still render with empty session name"
+        );
+    }
+
+    #[tokio::test]
+    async fn bar_narrow_terminal_no_panic() {
+        // Extremely narrow terminal — fill should saturate to 0, not panic.
+        let bar = render_bar("long-session-name", 5, 2, None).await;
+        assert!(bar.contains("[hm]"), "bar should render even at tiny width");
+    }
+
+    #[tokio::test]
+    async fn bar_contains_save_restore_cursor() {
+        let bar = render_bar("s", 80, 24, None).await;
+        assert!(bar.contains(SAVE_CURSOR), "bar should save cursor");
+        assert!(bar.contains(RESTORE_CURSOR), "bar should restore cursor");
+    }
+
+    #[tokio::test]
+    async fn bar_dead_state() {
+        let info = StatusInfo {
+            state_byte: 0xFF,
+            state_ms: 0,
+        };
+        let bar = render_bar("s1", 80, 24, Some(&info)).await;
+        assert!(bar.contains("dead"), "bar should show dead state");
+        assert!(
+            bar.contains(RED_BG_WHITE_FG),
+            "dead state should use red bg"
+        );
+    }
+
+    #[tokio::test]
+    async fn bar_no_info_shows_dots() {
+        let bar = render_bar("s1", 80, 24, None).await;
+        assert!(bar.contains("..."), "no info should show '...' placeholder");
+    }
+
+    // -- setup / resize / reset via real functions --
+
+    #[tokio::test]
+    async fn setup_status_bar_returns_inner_rows() {
+        let mut buf = Vec::new();
+        let inner = setup_status_bar(&mut buf, "test", 80, 24, None)
+            .await
+            .unwrap();
+        assert_eq!(inner, 23);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains(ALT_SCREEN_ON), "should enter alt screen");
+        assert!(output.contains("[hm]"), "should contain status bar");
+    }
+
+    #[tokio::test]
+    async fn setup_status_bar_clamps_zero_rows() {
+        let mut buf = Vec::new();
+        let inner = setup_status_bar(&mut buf, "test", 80, 0, None)
+            .await
+            .unwrap();
+        assert_eq!(inner, 1, "zero rows should clamp to 1");
+    }
+
+    #[tokio::test]
+    async fn setup_status_bar_clamps_one_row() {
+        let mut buf = Vec::new();
+        let inner = setup_status_bar(&mut buf, "test", 80, 1, None)
+            .await
+            .unwrap();
+        assert_eq!(inner, 1, "one row should clamp to 1");
+    }
+
+    #[tokio::test]
+    async fn resize_status_bar_returns_inner_rows() {
+        let mut buf = Vec::new();
+        let inner = resize_status_bar(&mut buf, "test", 120, 40, None)
+            .await
+            .unwrap();
+        assert_eq!(inner, 39);
+        let output = String::from_utf8(buf).unwrap();
+        // Should set scroll region but NOT enter alt screen.
+        assert!(!output.contains(ALT_SCREEN_ON));
+        assert!(output.contains("[hm]"), "should contain status bar");
+    }
+
+    #[tokio::test]
+    async fn reset_scroll_region_exits_alt_screen() {
+        let mut buf = Vec::new();
+        reset_scroll_region(&mut buf).await.unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains(ALT_SCREEN_OFF));
+        assert!(output.contains(SCROLL_REGION_RESET));
     }
 }

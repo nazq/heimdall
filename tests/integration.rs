@@ -2311,6 +2311,247 @@ fn kill_process_group_false_config() {
     let _ = child.wait();
 }
 
+/// With `kill_process_group = false`, grandchild processes survive session kill.
+/// Linux-only: macOS process group semantics under Rosetta are unreliable.
+#[test]
+#[cfg(target_os = "linux")]
+fn kill_process_group_spares_grandchildren() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket_dir = tmp.path().to_path_buf();
+    let session_id = "kpg-spare-gc";
+    let socket_path = socket_dir.join(format!("{session_id}.sock"));
+
+    let config_path = tmp.path().join("no-pg-kill.toml");
+    std::fs::write(&config_path, "kill_process_group = false\n").unwrap();
+
+    let mut child = Command::new(hm_bin())
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "run",
+            "--detach",
+            "--id",
+            session_id,
+            "--socket-dir",
+            socket_dir.to_str().unwrap(),
+            "--",
+            "bash",
+            "-c",
+            // nohup ignores SIGHUP so the grandchild survives when the PTY closes.
+            // This isolates what we're testing: does heimdall signal the grandchild,
+            // or just the direct child? (setsid is Linux-only, nohup is POSIX)
+            "nohup sleep 300 >/dev/null 2>&1 & echo $!; wait",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+
+    assert!(
+        wait_for_socket(&socket_path, Duration::from_secs(5)),
+        "socket never appeared"
+    );
+
+    // Subscribe and read output to capture the grandchild PID printed by echo $!
+    let mut stream = connect_and_handshake(&socket_path, Duration::from_secs(5));
+
+    let sub_frame: [u8; 5] = [0x02, 0, 0, 0, 0];
+    stream.write_all(&sub_frame).unwrap();
+
+    // Read output frames until we have the PID line.
+    let mut output_buf = Vec::new();
+    let start = std::time::Instant::now();
+    let mut grandchild_pid: Option<u32> = None;
+    while start.elapsed() < Duration::from_secs(5) {
+        let mut header = [0u8; 5];
+        match stream.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(_) => break,
+        }
+        let msg_type = header[0];
+        let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+        let mut payload = vec![0u8; len];
+        if len > 0 && stream.read_exact(&mut payload).is_err() {
+            break;
+        }
+        if msg_type == 0x81 {
+            output_buf.extend_from_slice(&payload);
+            // Try to parse the PID from output so far.
+            let text = String::from_utf8_lossy(&output_buf);
+            for line in text.lines() {
+                let trimmed = line.trim();
+                if let Ok(pid) = trimmed.parse::<u32>()
+                    && pid > 1
+                {
+                    grandchild_pid = Some(pid);
+                    break;
+                }
+            }
+            if grandchild_pid.is_some() {
+                break;
+            }
+        }
+    }
+
+    let gc_pid = grandchild_pid.expect("should have captured grandchild PID from output");
+
+    // Verify grandchild is alive before we kill the session.
+    assert_eq!(
+        unsafe { libc::kill(gc_pid as i32, 0) },
+        0,
+        "grandchild should be alive before session kill"
+    );
+
+    // Send KILL frame to terminate the session.
+    let kill_frame: [u8; 5] = [0x05, 0, 0, 0, 0];
+    stream.write_all(&kill_frame).unwrap();
+
+    // Wait for the session to exit (socket disappears).
+    let start = std::time::Instant::now();
+    let mut gone = false;
+    while start.elapsed() < Duration::from_secs(5) {
+        if !socket_path.exists() {
+            gone = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(gone, "socket should disappear after KILL");
+
+    // Give a moment for signals to propagate (if they were going to).
+    std::thread::sleep(Duration::from_millis(500));
+
+    // The grandchild should still be alive with kill_process_group=false.
+    let alive = unsafe { libc::kill(gc_pid as i32, 0) };
+    assert_eq!(
+        alive, 0,
+        "grandchild PID {gc_pid} should still be alive with kill_process_group=false"
+    );
+
+    // Clean up: kill the orphaned grandchild.
+    unsafe {
+        libc::kill(gc_pid as i32, libc::SIGKILL);
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// With `kill_process_group = true` (default), grandchild processes are killed.
+#[test]
+fn kill_process_group_kills_grandchildren() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket_dir = tmp.path().to_path_buf();
+    let session_id = "kpg-kill-gc";
+    let socket_path = socket_dir.join(format!("{session_id}.sock"));
+
+    // Default config has kill_process_group = true, but be explicit.
+    let config_path = tmp.path().join("pg-kill.toml");
+    std::fs::write(&config_path, "kill_process_group = true\n").unwrap();
+
+    let mut child = Command::new(hm_bin())
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "run",
+            "--detach",
+            "--id",
+            session_id,
+            "--socket-dir",
+            socket_dir.to_str().unwrap(),
+            "--",
+            "bash",
+            "-c",
+            "sleep 300 & echo $!; wait",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+
+    assert!(
+        wait_for_socket(&socket_path, Duration::from_secs(5)),
+        "socket never appeared"
+    );
+
+    // Subscribe and read output to capture the grandchild PID.
+    let mut stream = connect_and_handshake(&socket_path, Duration::from_secs(5));
+
+    let sub_frame: [u8; 5] = [0x02, 0, 0, 0, 0];
+    stream.write_all(&sub_frame).unwrap();
+
+    let mut output_buf = Vec::new();
+    let start = std::time::Instant::now();
+    let mut grandchild_pid: Option<u32> = None;
+    while start.elapsed() < Duration::from_secs(5) {
+        let mut header = [0u8; 5];
+        match stream.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(_) => break,
+        }
+        let msg_type = header[0];
+        let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+        let mut payload = vec![0u8; len];
+        if len > 0 && stream.read_exact(&mut payload).is_err() {
+            break;
+        }
+        if msg_type == 0x81 {
+            output_buf.extend_from_slice(&payload);
+            let text = String::from_utf8_lossy(&output_buf);
+            for line in text.lines() {
+                let trimmed = line.trim();
+                if let Ok(pid) = trimmed.parse::<u32>()
+                    && pid > 1
+                {
+                    grandchild_pid = Some(pid);
+                    break;
+                }
+            }
+            if grandchild_pid.is_some() {
+                break;
+            }
+        }
+    }
+
+    let gc_pid = grandchild_pid.expect("should have captured grandchild PID from output");
+
+    // Verify grandchild is alive before we kill the session.
+    assert_eq!(
+        unsafe { libc::kill(gc_pid as i32, 0) },
+        0,
+        "grandchild should be alive before session kill"
+    );
+
+    // Send KILL frame to terminate the session.
+    let kill_frame: [u8; 5] = [0x05, 0, 0, 0, 0];
+    stream.write_all(&kill_frame).unwrap();
+
+    // Wait for the session to exit (socket disappears).
+    let start = std::time::Instant::now();
+    let mut gone = false;
+    while start.elapsed() < Duration::from_secs(5) {
+        if !socket_path.exists() {
+            gone = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(gone, "socket should disappear after KILL");
+
+    // Give time for process group signal to propagate.
+    std::thread::sleep(Duration::from_millis(500));
+
+    // The grandchild should be dead with kill_process_group=true.
+    let alive = unsafe { libc::kill(gc_pid as i32, 0) };
+    assert_ne!(
+        alive, 0,
+        "grandchild PID {gc_pid} should be dead with kill_process_group=true"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Custom `session_env_var` config injects the session ID into the child env.
 #[test]
 fn custom_session_env_var() {
@@ -3577,6 +3818,508 @@ fn many_connections_lifecycle() {
     // One final check.
     let mut stream = connect_and_handshake(&socket_path, Duration::from_secs(5));
     assert_status_alive(&mut stream);
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+// -- Protocol hardening: unknown/unexpected frames --
+
+/// Send a frame with an unknown message type, then verify the supervisor still
+/// responds correctly to a valid STATUS request.
+#[test]
+fn unknown_message_type_does_not_crash() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut child, socket_path) = spawn_session("unk-type", tmp.path(), &["sleep", "30"]);
+
+    let mut stream = connect_and_handshake(&socket_path, Duration::from_secs(5));
+
+    // Send a frame with unknown type 0xAA, empty payload.
+    let unknown_frame: [u8; 5] = [0xAA, 0, 0, 0, 0];
+    stream.write_all(&unknown_frame).unwrap();
+
+    // Give the supervisor a moment to process the unknown frame.
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Send a valid STATUS request — supervisor must still respond.
+    assert_status_alive(&mut stream);
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Send multiple unknown-type frames, then verify STATUS still works.
+/// The supervisor must be resilient to repeated bogus frames.
+#[test]
+fn valid_frames_after_unknown_type() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut child, socket_path) = spawn_session("multi-unk-type", tmp.path(), &["sleep", "30"]);
+
+    let mut stream = connect_and_handshake(&socket_path, Duration::from_secs(5));
+
+    // Send several unknown-type frames with varying payloads.
+    for type_byte in [0xAA, 0xBB, 0xCC, 0x7F, 0x06] {
+        let payload = b"bogus";
+        let len = (payload.len() as u32).to_be_bytes();
+        let mut frame = Vec::with_capacity(5 + payload.len());
+        frame.push(type_byte);
+        frame.extend_from_slice(&len);
+        frame.extend_from_slice(payload);
+        stream.write_all(&frame).unwrap();
+    }
+
+    // Give the supervisor time to process the unknown frames.
+    std::thread::sleep(Duration::from_millis(300));
+
+    // STATUS must still work after all the bogus frames.
+    assert_status_alive(&mut stream);
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Sending SUBSCRIBE twice on the same connection must not crash the supervisor.
+/// The second SUBSCRIBE may be silently ignored or produce an error frame —
+/// either is acceptable as long as the supervisor stays alive.
+#[test]
+fn subscribe_after_subscribe() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut child, socket_path) = spawn_session("double-sub", tmp.path(), &["sleep", "30"]);
+
+    let mut stream = connect_and_handshake(&socket_path, Duration::from_secs(5));
+
+    // Send SUBSCRIBE twice.
+    let sub_frame: [u8; 5] = [0x02, 0, 0, 0, 0];
+    stream.write_all(&sub_frame).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    stream.write_all(&sub_frame).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Drop this connection and open a fresh one to verify the supervisor is alive.
+    drop(stream);
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut stream2 = connect_and_handshake(&socket_path, Duration::from_secs(5));
+    assert_status_alive(&mut stream2);
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Send a KILL frame with an unexpected non-empty payload. The supervisor should
+/// still honour the KILL and shut down the child gracefully.
+#[test]
+fn kill_with_payload() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (child, socket_path) = spawn_session("kill-payload", tmp.path(), &["sleep", "60"]);
+
+    let mut stream = connect_and_handshake(&socket_path, Duration::from_secs(5));
+
+    // Verify the session is alive before we kill it.
+    assert_status_alive(&mut stream);
+
+    // Send KILL (type=0x05) with a spurious 4-byte payload.
+    let payload = b"junk";
+    let len = (payload.len() as u32).to_be_bytes();
+    let mut kill_frame = Vec::with_capacity(5 + payload.len());
+    kill_frame.push(0x05);
+    kill_frame.extend_from_slice(&len);
+    kill_frame.extend_from_slice(payload);
+    stream.write_all(&kill_frame).unwrap();
+
+    // The supervisor should exit within a few seconds.
+    let status = child
+        .wait_with_output()
+        .expect("failed to wait for supervisor");
+    // The supervisor exits — we don't assert the exit code because KILL may
+    // propagate the child's signal exit code.
+    let _ = status;
+}
+
+/// Send a STATUS frame with an unexpected non-empty payload. The supervisor
+/// should ignore the extra bytes and respond with a valid STATUS_RESP.
+#[test]
+fn status_with_payload() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut child, socket_path) = spawn_session("status-payload", tmp.path(), &["sleep", "30"]);
+
+    let mut stream = connect_and_handshake(&socket_path, Duration::from_secs(5));
+
+    // Send STATUS (type=0x03) with a spurious 8-byte payload.
+    let payload = b"extraaaa";
+    let len = (payload.len() as u32).to_be_bytes();
+    let mut status_frame = Vec::with_capacity(5 + payload.len());
+    status_frame.push(0x03);
+    status_frame.extend_from_slice(&len);
+    status_frame.extend_from_slice(payload);
+    stream.write_all(&status_frame).unwrap();
+
+    // Read the response — should be a valid STATUS_RESP.
+    let mut header = [0u8; 5];
+    stream.read_exact(&mut header).unwrap();
+    assert_eq!(header[0], 0x82, "expected STATUS_RESP (0x82)");
+    let resp_len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]);
+    assert_eq!(resp_len, 15, "STATUS_RESP payload must be 15 bytes");
+
+    let mut resp_payload = [0u8; 15];
+    stream.read_exact(&mut resp_payload).unwrap();
+    let pid = u32::from_be_bytes([
+        resp_payload[0],
+        resp_payload[1],
+        resp_payload[2],
+        resp_payload[3],
+    ]);
+    let alive = resp_payload[8];
+    assert!(pid > 0, "pid should be nonzero");
+    assert_eq!(alive, 1, "alive should be 1");
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+// -- Subscribed-mode protocol coverage --
+//
+// The existing protocol hardening tests (unknown_message_type_does_not_crash,
+// subscribe_after_subscribe, etc.) exercise the UNSUBSCRIBED dispatch loop.
+// These tests exercise the `handle_subscribed` select! loop where a client
+// has already sent SUBSCRIBE and is receiving OUTPUT frames.
+
+/// After subscribing, send INPUT frames and verify the input reaches the child
+/// by reading the echoed output back as OUTPUT frames.
+#[test]
+fn input_while_subscribed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut child, socket_path) = spawn_session("sub-input", tmp.path(), &["bash"]);
+
+    let mut stream = connect_and_handshake(&socket_path, Duration::from_secs(5));
+
+    // Subscribe.
+    let sub_frame: [u8; 5] = [0x02, 0, 0, 0, 0];
+    stream.write_all(&sub_frame).unwrap();
+
+    // Give bash time to start and emit its prompt.
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Send INPUT: "echo SUB_INPUT_MARKER\r"
+    let input = build_input_frame(b"echo SUB_INPUT_MARKER\r");
+    stream.write_all(&input).unwrap();
+
+    // Read OUTPUT frames until we see the marker or timeout.
+    let mut output_data = Vec::new();
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        let mut header = [0u8; 5];
+        match stream.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(_) => break,
+        }
+        let msg_type = header[0];
+        let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+        let mut payload = vec![0u8; len];
+        if len > 0 && stream.read_exact(&mut payload).is_err() {
+            break;
+        }
+        if msg_type == 0x81 {
+            output_data.extend_from_slice(&payload);
+            let s = String::from_utf8_lossy(&output_data);
+            if s.contains("SUB_INPUT_MARKER") {
+                break;
+            }
+        }
+    }
+
+    let output_str = String::from_utf8_lossy(&output_data);
+    assert!(
+        output_str.contains("SUB_INPUT_MARKER"),
+        "subscribed INPUT should round-trip through the pty: {output_str}"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// After subscribing, send a STATUS frame and verify a STATUS_RESP comes back
+/// interleaved with any output frames.
+#[test]
+fn status_while_subscribed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut child, socket_path) = spawn_session(
+        "sub-status",
+        tmp.path(),
+        &["bash", "-c", "echo ALIVE_CHECK && sleep 30"],
+    );
+
+    let mut stream = connect_and_handshake(&socket_path, Duration::from_secs(5));
+
+    // Subscribe.
+    let sub_frame: [u8; 5] = [0x02, 0, 0, 0, 0];
+    stream.write_all(&sub_frame).unwrap();
+
+    // Let some output frames arrive.
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Send STATUS while subscribed.
+    let status_frame: [u8; 5] = [0x03, 0, 0, 0, 0];
+    stream.write_all(&status_frame).unwrap();
+
+    // Read frames until we get STATUS_RESP (0x82) or timeout.
+    let mut got_status_resp = false;
+    let mut pid: u32 = 0;
+    let mut alive: u8 = 0;
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        let mut header = [0u8; 5];
+        match stream.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(_) => break,
+        }
+        let msg_type = header[0];
+        let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+        let mut payload = vec![0u8; len];
+        if len > 0 && stream.read_exact(&mut payload).is_err() {
+            break;
+        }
+        if msg_type == 0x82 {
+            assert_eq!(len, 15, "STATUS_RESP payload must be 15 bytes");
+            pid = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+            alive = payload[8];
+            got_status_resp = true;
+            break;
+        }
+        // 0x81 (OUTPUT) frames are expected and skipped.
+    }
+
+    assert!(
+        got_status_resp,
+        "should receive STATUS_RESP while subscribed"
+    );
+    assert!(pid > 0, "pid should be nonzero in subscribed STATUS_RESP");
+    assert_eq!(alive, 1, "alive should be 1 in subscribed STATUS_RESP");
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// After subscribing, send a RESIZE frame and verify the supervisor doesn't
+/// crash by sending a STATUS query afterward.
+#[test]
+fn resize_while_subscribed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut child, socket_path) =
+        spawn_session("sub-resize", tmp.path(), &["bash", "-c", "sleep 30"]);
+
+    let mut stream = connect_and_handshake(&socket_path, Duration::from_secs(5));
+
+    // Subscribe.
+    let sub_frame: [u8; 5] = [0x02, 0, 0, 0, 0];
+    stream.write_all(&sub_frame).unwrap();
+
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Send RESIZE while subscribed.
+    let resize = build_resize_frame(132, 48);
+    stream.write_all(&resize).unwrap();
+
+    // Small pause for processing.
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Send STATUS to confirm supervisor is still responsive.
+    let status_frame: [u8; 5] = [0x03, 0, 0, 0, 0];
+    stream.write_all(&status_frame).unwrap();
+
+    // Read frames until STATUS_RESP.
+    let mut got_status_resp = false;
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        let mut header = [0u8; 5];
+        match stream.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(_) => break,
+        }
+        let msg_type = header[0];
+        let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+        let mut payload = vec![0u8; len];
+        if len > 0 && stream.read_exact(&mut payload).is_err() {
+            break;
+        }
+        if msg_type == 0x82 {
+            assert_eq!(len, 15, "STATUS_RESP payload must be 15 bytes");
+            let alive = payload[8];
+            assert_eq!(alive, 1, "alive should be 1 after RESIZE while subscribed");
+            got_status_resp = true;
+            break;
+        }
+    }
+
+    assert!(
+        got_status_resp,
+        "should receive STATUS_RESP after RESIZE while subscribed"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// After subscribing, send a KILL frame and verify an EXIT (0x83) frame
+/// arrives on the subscription stream.
+#[test]
+fn kill_while_subscribed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (child, socket_path) = spawn_session("sub-kill", tmp.path(), &["sleep", "60"]);
+
+    let mut stream = connect_and_handshake(&socket_path, Duration::from_secs(5));
+
+    // Subscribe.
+    let sub_frame: [u8; 5] = [0x02, 0, 0, 0, 0];
+    stream.write_all(&sub_frame).unwrap();
+
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Send KILL while subscribed.
+    let kill_frame: [u8; 5] = [0x05, 0, 0, 0, 0];
+    stream.write_all(&kill_frame).unwrap();
+
+    // Read frames until EXIT (0x83) or timeout.
+    let mut got_exit = false;
+    let mut exit_code: Option<i32> = None;
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        let mut header = [0u8; 5];
+        match stream.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(_) => break,
+        }
+        let msg_type = header[0];
+        let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+        let mut payload = vec![0u8; len];
+        if len > 0 && stream.read_exact(&mut payload).is_err() {
+            break;
+        }
+        if msg_type == 0x83 {
+            got_exit = true;
+            assert_eq!(
+                payload.len(),
+                4,
+                "EXIT frame payload must be exactly 4 bytes"
+            );
+            exit_code = Some(i32::from_be_bytes([
+                payload[0], payload[1], payload[2], payload[3],
+            ]));
+            break;
+        }
+    }
+
+    assert!(
+        got_exit,
+        "subscriber should receive EXIT frame after KILL while subscribed"
+    );
+    // SIGTERM kills sleep, so exit code should be non-zero (signal death).
+    assert!(
+        exit_code.unwrap() != 0,
+        "exit code after KILL should be non-zero (signal death), got {:?}",
+        exit_code
+    );
+
+    let _ = child.wait_with_output();
+}
+
+/// After subscribing, send an unknown frame type (0xAA) and verify the
+/// subscription still works — output still flows and STATUS still responds.
+#[test]
+fn unknown_type_while_subscribed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut child, socket_path) = spawn_session(
+        "sub-unknown",
+        tmp.path(),
+        &["bash", "-c", "sleep 0.5 && echo STILL_ALIVE && sleep 30"],
+    );
+
+    let mut stream = connect_and_handshake(&socket_path, Duration::from_secs(5));
+
+    // Subscribe.
+    let sub_frame: [u8; 5] = [0x02, 0, 0, 0, 0];
+    stream.write_all(&sub_frame).unwrap();
+
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Send unknown frame type while subscribed.
+    let unknown_frame: [u8; 5] = [0xAA, 0, 0, 0, 0];
+    stream.write_all(&unknown_frame).unwrap();
+
+    // Send another unknown with a payload for good measure.
+    let payload = b"bogus";
+    let len = (payload.len() as u32).to_be_bytes();
+    let mut unknown_with_payload = Vec::with_capacity(5 + payload.len());
+    unknown_with_payload.push(0xBB);
+    unknown_with_payload.extend_from_slice(&len);
+    unknown_with_payload.extend_from_slice(payload);
+    stream.write_all(&unknown_with_payload).unwrap();
+
+    // Verify output still flows: read until STILL_ALIVE marker.
+    let mut output_data = Vec::new();
+    let start = std::time::Instant::now();
+    let mut found_marker = false;
+    while start.elapsed() < Duration::from_secs(5) {
+        let mut header = [0u8; 5];
+        match stream.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(_) => break,
+        }
+        let msg_type = header[0];
+        let flen = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+        let mut fpayload = vec![0u8; flen];
+        if flen > 0 && stream.read_exact(&mut fpayload).is_err() {
+            break;
+        }
+        if msg_type == 0x81 {
+            output_data.extend_from_slice(&fpayload);
+            let s = String::from_utf8_lossy(&output_data);
+            if s.contains("STILL_ALIVE") {
+                found_marker = true;
+                break;
+            }
+        }
+    }
+
+    assert!(
+        found_marker,
+        "output should still flow after unknown frame type while subscribed"
+    );
+
+    // Send STATUS to confirm protocol is still working.
+    let status_frame: [u8; 5] = [0x03, 0, 0, 0, 0];
+    stream.write_all(&status_frame).unwrap();
+
+    let mut got_status_resp = false;
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(3) {
+        let mut header = [0u8; 5];
+        match stream.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(_) => break,
+        }
+        let msg_type = header[0];
+        let flen = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+        let mut fpayload = vec![0u8; flen];
+        if flen > 0 && stream.read_exact(&mut fpayload).is_err() {
+            break;
+        }
+        if msg_type == 0x82 {
+            assert_eq!(flen, 15, "STATUS_RESP payload must be 15 bytes");
+            let alive = fpayload[8];
+            assert_eq!(
+                alive, 1,
+                "alive should be 1 after unknown frames while subscribed"
+            );
+            got_status_resp = true;
+            break;
+        }
+    }
+
+    assert!(
+        got_status_resp,
+        "should receive STATUS_RESP after unknown frames while subscribed"
+    );
 
     let _ = child.kill();
     let _ = child.wait();

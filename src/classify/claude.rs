@@ -190,7 +190,10 @@ impl StateClassifier for ClaudeClassifier {
         self.state_entered_at = now_ms;
         self.pending_state = None;
     }
+}
 
+#[cfg(test)]
+impl ClaudeClassifier {
     fn state_name(&self, state: u8) -> &'static str {
         match state {
             0x00 => "idle",

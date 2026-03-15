@@ -54,9 +54,6 @@ pub trait StateClassifier: Send {
 
     /// Force state to Dead (on child exit).
     fn set_dead(&mut self, now_ms: u64);
-
-    /// Human-readable name for a state byte.
-    fn state_name(&self, state: u8) -> &'static str;
 }
 
 /// Create a classifier from config.
@@ -96,7 +93,6 @@ mod tests {
             debounce_ms: 200,
         });
         assert_eq!(c.state(), ProcessState::Idle);
-        assert_eq!(c.state_name(0x01), "thinking"); // only claude knows "thinking"
     }
 
     #[test]
@@ -105,15 +101,12 @@ mod tests {
             idle_threshold_ms: 3000,
         });
         assert_eq!(c.state(), ProcessState::Idle);
-        assert_eq!(c.state_name(0x04), "active"); // simple knows "active"
-        assert_eq!(c.state_name(0x01), "unknown"); // simple doesn't know "thinking"
     }
 
     #[test]
     fn from_config_none() {
         let c = from_config(&ClassifierConfig::None);
         assert_eq!(c.state(), ProcessState::Idle);
-        assert_eq!(c.state_name(0x01), "idle"); // none reports everything as idle
     }
 
     /// Issue #6: classifier orthogonality — simple uses Active, claude never does.

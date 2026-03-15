@@ -35,7 +35,7 @@ const STATUS_POLL_INTERVAL: std::time::Duration =
 /// (Ctrl-\ or session exit), the supervisor keeps running in the background.
 pub fn launch_and_attach(params: SessionParams) -> anyhow::Result<()> {
     let exe = std::env::current_exe()?;
-    let child_args = params.to_detach_args();
+    let child_args = params.to_detach_args()?;
 
     // Spawn supervisor in background with setsid() for terminal independence.
     let _supervisor = unsafe {
