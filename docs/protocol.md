@@ -22,9 +22,17 @@ Total overhead per frame: 5 bytes.
 
 On connect, the supervisor immediately writes a single **mode byte**:
 
-| Byte   | Meaning        |
-|--------|----------------|
-| `0x00` | Binary framing |
+| Byte   | Meaning                    |
+|--------|----------------------------|
+| `0x00` | Binary framing (active)    |
+| `0x01` | Text/debug mode (reserved) |
+
+The mode byte exists so that future versions can offer a human-readable text
+protocol (mode `0x01`) where you could connect with `socat` or `netcat` and
+interact without a custom client. Today only binary framing (`0x00`) is
+implemented — the supervisor always sends `0x00`, and clients should assert
+this value. Mode `0x01` is reserved for future use and is not handled by the
+supervisor or any built-in client.
 
 The client must read this byte before sending any frames. This byte is not
 framed — it's a raw single byte on the wire.
@@ -116,3 +124,79 @@ loop:
 
 Any language with Unix socket support and the ability to read/write bytes can
 be a heimdall client.
+
+## Example: minimal Go client
+
+A self-contained subscriber that connects to a heimdall session, prints pty
+output to stdout, and exits with the child's exit code.
+
+```go
+package main
+
+import (
+	"encoding/binary"
+	"fmt"
+	"io"
+	"net"
+	"os"
+)
+
+func main() {
+	if len(os.Args) < 2 {
+		fmt.Fprintf(os.Stderr, "usage: %s <socket-path>\n", os.Args[0])
+		os.Exit(1)
+	}
+
+	conn, err := net.Dial("unix", os.Args[1])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "connect: %v\n", err)
+		os.Exit(1)
+	}
+	defer conn.Close()
+
+	// Read mode byte — must be 0x00 (binary framing).
+	mode := make([]byte, 1)
+	if _, err := io.ReadFull(conn, mode); err != nil {
+		fmt.Fprintf(os.Stderr, "read mode byte: %v\n", err)
+		os.Exit(1)
+	}
+	if mode[0] != 0x00 {
+		fmt.Fprintf(os.Stderr, "unsupported mode: 0x%02x\n", mode[0])
+		os.Exit(1)
+	}
+
+	// Send SUBSCRIBE frame: type=0x02, length=0.
+	subscribe := []byte{0x02, 0x00, 0x00, 0x00, 0x00}
+	if _, err := conn.Write(subscribe); err != nil {
+		fmt.Fprintf(os.Stderr, "send subscribe: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Read frames until EXIT.
+	header := make([]byte, 5)
+	for {
+		if _, err := io.ReadFull(conn, header); err != nil {
+			fmt.Fprintf(os.Stderr, "read frame: %v\n", err)
+			os.Exit(1)
+		}
+		msgType := header[0]
+		length := binary.BigEndian.Uint32(header[1:5])
+
+		payload := make([]byte, length)
+		if length > 0 {
+			if _, err := io.ReadFull(conn, payload); err != nil {
+				fmt.Fprintf(os.Stderr, "read payload: %v\n", err)
+				os.Exit(1)
+			}
+		}
+
+		switch msgType {
+		case 0x81: // OUTPUT — write pty data to stdout.
+			os.Stdout.Write(payload)
+		case 0x83: // EXIT — child exited, payload is i32 BE exit code.
+			code := int32(binary.BigEndian.Uint32(payload))
+			os.Exit(int(code))
+		}
+	}
+}
+```

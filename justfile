@@ -29,9 +29,9 @@ check: clippy fmt-check test-all
 test *args:
     cargo test {{ args }}
 
-# Run Python attach tests (requires pexpect)
+# Run Python attach tests
 test-attach: build
-    python3 tests/test_attach.py
+    uv run pytest tests/ -v
 
 # Run full integration suite (Rust + Python attach tests)
 test-all: test test-attach
@@ -81,7 +81,7 @@ doctor:
     @echo "Checking dependencies..."
     @which cargo >/dev/null 2>&1 && echo "  cargo: $(cargo --version)" || echo "  cargo: MISSING"
     @which just >/dev/null 2>&1 && echo "  just: $(just --version)" || echo "  just: MISSING"
-    @python3 -c "import pexpect" 2>/dev/null && echo "  pexpect: ok" || echo "  pexpect: MISSING (pip install pexpect — needed for attach tests)"
+    @which uv >/dev/null 2>&1 && echo "  uv: $(uv --version)" || echo "  uv: MISSING (needed for Python attach tests)"
     @which cargo-llvm-cov >/dev/null 2>&1 && echo "  cargo-llvm-cov: ok" || echo "  cargo-llvm-cov: MISSING (optional, for coverage)"
     @echo "Done."
 

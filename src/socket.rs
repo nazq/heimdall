@@ -2,6 +2,7 @@
 
 use crate::broadcast::OutputState;
 use crate::protocol::{self, INPUT, KILL, OUTPUT, RESIZE, STATUS, SUBSCRIBE};
+use bytes::Bytes;
 use nix::unistd::Pid;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -55,7 +56,7 @@ async fn handle_client(stream: UnixStream, state: &ServerState) -> std::io::Resu
 
         match msg_type {
             INPUT => {
-                write_to_pty(state, payload.to_vec()).await?;
+                write_to_pty(state, payload).await?;
             }
             SUBSCRIBE => {
                 handle_subscribed(state, reader, &mut write_half).await?;
@@ -99,7 +100,7 @@ async fn handle_subscribed(
             result = rx.recv() => {
                 match result {
                     Ok(chunk) => {
-                        if !state.alive.load(Ordering::Relaxed) {
+                        if !state.alive.load(Ordering::Acquire) {
                             // After alive=false, the only broadcast is the EXIT frame.
                             // Write it directly (it's already fully framed).
                             writer.write_all(&chunk).await?;
@@ -112,8 +113,9 @@ async fn handle_subscribed(
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         // Channel closed — send EXIT frame if we haven't already.
-                        let code = state.exit_code.load(Ordering::Relaxed);
-                        if !state.alive.load(Ordering::Relaxed) {
+                        // Use Acquire so the exit_code store in broadcast_exit is visible.
+                        let code = state.exit_code.load(Ordering::Acquire);
+                        if !state.alive.load(Ordering::Acquire) {
                             let exit_frame = protocol::pack_exit(code);
                             let _ = writer.write_all(&exit_frame).await;
                         }
@@ -127,7 +129,7 @@ async fn handle_subscribed(
                 let (msg_type, payload) = result?;
                 match msg_type {
                     INPUT => {
-                        write_to_pty(state, payload.to_vec()).await?;
+                        write_to_pty(state, payload).await?;
                     }
                     RESIZE => {
                         handle_resize(state, &payload)?;
@@ -149,8 +151,9 @@ async fn handle_subscribed(
 
 /// Write raw bytes to the pty master fd.
 /// Checks `alive` before writing to avoid writing to a closed/reused fd.
-async fn write_to_pty(state: &ServerState, data: Vec<u8>) -> std::io::Result<()> {
-    if !state.alive.load(Ordering::Relaxed) {
+/// Accepts `Bytes` to avoid copying the payload out of the frame buffer.
+async fn write_to_pty(state: &ServerState, data: Bytes) -> std::io::Result<()> {
+    if !state.alive.load(Ordering::Acquire) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::BrokenPipe,
             "child process has exited",
@@ -173,7 +176,7 @@ async fn write_to_pty(state: &ServerState, data: Vec<u8>) -> std::io::Result<()>
 async fn send_status(state: &ServerState, writer: &mut OwnedWriteHalf) -> std::io::Result<()> {
     let pid = state.child_pid.as_raw() as u32;
     let idle_ms = state.output.idle_ms();
-    let alive = state.alive.load(Ordering::Relaxed);
+    let alive = state.alive.load(Ordering::Acquire);
     let process_state = state.output.process_state() as u8;
     let state_ms = state.output.state_ms();
     let frame = protocol::pack_status(pid, idle_ms, alive, process_state, state_ms);
@@ -182,20 +185,8 @@ async fn send_status(state: &ServerState, writer: &mut OwnedWriteHalf) -> std::i
 
 /// Handle a RESIZE frame.
 fn handle_resize(state: &ServerState, payload: &[u8]) -> std::io::Result<()> {
-    if payload.len() >= 4 {
-        let cols = u16::from_be_bytes([payload[0], payload[1]]);
-        let rows = u16::from_be_bytes([payload[2], payload[3]]);
-        crate::pty::set_winsize_raw(state.master_fd, cols, rows)?;
-        let _ = crate::pty::send_sigwinch(state.child_pid);
-    }
+    let (cols, rows) = protocol::parse_resize(payload)?;
+    crate::pty::set_winsize_raw(state.master_fd, cols, rows)?;
+    let _ = crate::pty::send_sigwinch(state.child_pid);
     Ok(())
-}
-
-/// Broadcast an exit notification to all subscribers.
-///
-/// Stores the exit code and sends the fully-framed EXIT message through the
-/// broadcast channel. Subscribers write it directly (not wrapped in OUTPUT).
-pub async fn broadcast_exit(state: &Arc<ServerState>, exit_code: i32) {
-    state.exit_code.store(exit_code, Ordering::Relaxed);
-    let _ = state.output.tx.send(protocol::pack_exit(exit_code));
 }
