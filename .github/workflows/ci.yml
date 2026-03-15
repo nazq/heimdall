@@ -99,8 +99,17 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
       - name: Generate coverage
-        run: cargo llvm-cov --lcov --output-path lcov.info
+        run: |
+          source <(cargo llvm-cov show-env --sh)
+          cargo llvm-cov clean --workspace
+          cargo build
+          cargo test
+          HM_BIN="$PWD/target/debug/hm" uv run pytest tests/ -v
+          cargo llvm-cov report --lcov --output-path lcov.info
 
       - name: Upload to Codecov
         uses: codecov/codecov-action@v5

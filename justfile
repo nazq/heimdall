@@ -36,9 +36,18 @@ test-attach: build
 # Run full integration suite (Rust + Python attach tests)
 test-all: test test-attach
 
-# Run tests with coverage (requires cargo-llvm-cov)
+# Run tests with coverage (requires cargo-llvm-cov + uv)
+# Mirrors the CI coverage workflow exactly.
 cov:
-    cargo llvm-cov --lcov --output-path lcov.info
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source <(cargo llvm-cov show-env --sh)
+    cargo llvm-cov clean --workspace
+    cargo build
+    cargo test
+    HM_BIN="$(pwd)/target/debug/hm" uv run pytest tests/ -v
+    cargo llvm-cov report --lcov --output-path lcov.info
+    cargo llvm-cov report --summary-only
 
 # Lint with clippy
 clippy:
