@@ -18,6 +18,16 @@ Heimdall resolves config in this order:
 The first file found wins. Files are not merged — if `./heimdall.toml`
 exists, the global config is not read.
 
+## Precedence
+
+Within a single run, configuration follows a three-tier precedence:
+
+**CLI flags > config file > built-in defaults**
+
+For example, `hm run --idle-threshold-ms 5000` overrides whatever
+`idle_threshold_ms` is set in the config file, which itself overrides the
+built-in default of 3000.
+
 ## All options
 
 ```toml
@@ -34,27 +44,67 @@ scrollback_bytes = 65536
 # Default: HEIMDALL_SESSION_ID
 session_env_var = "HEIMDALL_SESSION_ID"
 
-# State classifier: "claude", "simple", or "none".
-# See docs/classifiers.md for details.
-# Default: "claude"
-classifier = "claude"
+# Signal the entire process group on kill/shutdown.
+# When true (default), SIGTERM/SIGKILL reach all grandchild processes.
+# Set to false to only signal the direct child.
+kill_process_group = true
 
-# Milliseconds of silence before the classifier transitions to Idle.
-# Default: 3000
-idle_threshold_ms = 3000
+# Log file path for the supervisor.
+# Default: <socket_dir>/<id>.log. Set to /dev/null to disable.
+# log_file = "/var/log/heimdall/session.log"
 
-# Milliseconds a candidate state must persist before the classifier commits
-# to the transition. Prevents rapid flickering on ambiguous output.
-# Default: 200
-debounce_ms = 200
+# Log level for the supervisor (trace, debug, info, warn, error).
+# RUST_LOG env var overrides this.
+# Default: info
+log_level = "info"
+
+# Detach key byte for the attach client.
+# Default: 28 (0x1C, Ctrl-\). Set to 0 to disable.
+# detach_key = 28
+
+# State classifier — string shorthand (built-in defaults):
+classifier = "simple"    # or "claude" or "none"
+
+# Or table form with per-classifier parameters:
+# [classifier.simple]
+# idle_threshold_ms = 3000
+
+# [classifier.claude]
+# idle_threshold_ms = 3000
+# debounce_ms = 200
+
+# [classifier.none]
 
 # Extra environment variables injected into the child process.
-# These are set in the pre-exec seam after fork(), so they're inherited by
-# the child's entire process tree.
+# Set in the pre-exec seam after fork(), inherited by the child's entire tree.
 [[env]]
 name = "MY_VAR"
 value = "my_value"
 ```
+
+## Classifier parameters
+
+Each classifier carries its own parameters. See
+[classifiers.md](classifiers.md) for full details.
+
+| Parameter | Classifiers | Default | Description |
+|---|---|---|---|
+| `idle_threshold_ms` | simple, claude | 3000 | Silence duration (ms) before idle |
+| `debounce_ms` | claude | 200 | State transition debounce (ms) |
+
+## CLI flags for `hm run`
+
+| Flag | Overrides | Description |
+|---|---|---|
+| `--socket-dir` | `socket_dir` | Socket/PID directory |
+| `--scrollback-bytes` | `scrollback_bytes` | Scrollback buffer size |
+| `--session-env-var` | `session_env_var` | Env var name for session ID |
+| `--kill-process-group` | `kill_process_group` | Process group signalling |
+| `--classifier` | `classifier` | Classifier type (simple/claude/none) |
+| `--idle-threshold-ms` | per-classifier | Idle detection threshold |
+| `--debounce-ms` | per-classifier | State transition debounce |
+| `--log-file` | `log_file` | Supervisor log file (default: `<socket_dir>/<id>.log`) |
+| `--log-level` | `log_level` | Log level: trace, debug, info, warn, error |
 
 ## Per-project config
 

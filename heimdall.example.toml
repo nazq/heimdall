@@ -10,23 +10,50 @@
 # Environment variable name injected into child processes with the session ID.
 # session_env_var = "HEIMDALL_SESSION_ID"
 
-# State classifier: "claude", "simple", or "none".
+# Signal the entire process group on kill/shutdown.
+# When true (default), SIGTERM/SIGKILL reach all grandchild processes.
+# Set to false to only signal the direct child.
+# kill_process_group = true
+
+# Log file path for the supervisor.
+# Default: <socket_dir>/<id>.log. Set to /dev/null to disable.
+# log_file = "/var/log/heimdall/session.log"
+
+# Log level for the supervisor (trace, debug, info, warn, error).
+# RUST_LOG env var overrides this.
+# log_level = "info"
+
+# Detach key byte for the attach client.
+# Default: 28 (0x1C, Ctrl-\). Set to 0 to disable detaching.
+# detach_key = 28
+
+# --- State classifier ---
 #
+# String shorthand (uses built-in defaults for the classifier):
+#   classifier = "simple"
+#
+# Or table form with per-classifier parameters:
+#
+#   [classifier.simple]
+#   idle_threshold_ms = 3000
+#
+#   [classifier.claude]
+#   idle_threshold_ms = 3000
+#   debounce_ms = 200
+#
+# Available classifiers:
+#
+#   simple  — binary idle/active based on silence threshold (default).
 #   claude  — full state machine (idle/thinking/streaming/tool_use)
 #             tuned for Claude Code spinner and token output patterns.
-#   simple  — binary idle/active based on silence threshold.
 #   none    — no classification, always reports idle.
+
+# Default: simple with 3000ms idle threshold.
+# classifier = "simple"
+
+# --- Extra environment variables ---
+# Injected into the child process at launch.
 #
-# classifier = "claude"
-
-# Idle detection threshold in milliseconds.
-# idle_threshold_ms = 3000
-
-# State debounce period in milliseconds.
-# Prevents rapid state flickering on ambiguous output.
-# debounce_ms = 200
-
-# Extra environment variables injected into the child process.
 # [[env]]
 # name = "MY_API_KEY"
 # value = "sk-..."

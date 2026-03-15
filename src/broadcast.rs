@@ -39,11 +39,7 @@ pub struct OutputState {
 impl OutputState {
     pub fn new(config: &Config) -> Self {
         let (tx, _) = broadcast::channel(256);
-        let classifier = classify::from_config(
-            &config.classifier,
-            config.idle_threshold_ms,
-            config.debounce_ms,
-        );
+        let classifier = classify::from_config(&config.classifier);
         Self {
             tx,
             last_output_at: AtomicU64::new(now_millis()),
@@ -66,7 +62,8 @@ impl OutputState {
     pub fn idle_ms(&self) -> u32 {
         let last = self.last_output_at.load(Ordering::Relaxed);
         let now = now_millis();
-        (now.saturating_sub(last)) as u32
+        // Saturate at u32::MAX (~49 days) rather than wrapping.
+        now.saturating_sub(last).min(u32::MAX as u64) as u32
     }
 
     /// Current process state.

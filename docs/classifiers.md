@@ -43,9 +43,18 @@ classifier produced it. The `none` classifier always reports Idle.
 
 ## Built-in classifiers
 
-### `claude` (default)
+### `simple` (default)
 
-Full state machine tuned for Claude Code's terminal output patterns.
+Binary idle/active classifier. Reports:
+- **Idle** when silence exceeds the threshold.
+- **Active** when there's been recent output.
+
+No pattern analysis. This is the recommended default for general use — it
+works with any program and has negligible overhead.
+
+### `claude`
+
+Specialized state machine tuned for Claude Code's terminal output patterns.
 
 Uses a sliding window of the last 20 output events. For each new event it:
 
@@ -61,15 +70,6 @@ Uses a sliding window of the last 20 output events. For each new event it:
 State transitions are **debounced** (`debounce_ms`, default 200ms) to prevent
 rapid flickering. Idle transitions are instant since silence is unambiguous.
 
-### `simple`
-
-Binary idle/active classifier. Reports:
-- **Idle** when silence exceeds the threshold.
-- **Active** when there's been recent output.
-
-No pattern analysis. Useful for processes where you only care whether
-something is happening or not.
-
 ### `none`
 
 Null classifier. Always reports Idle. Use when you only need pty supervision,
@@ -77,13 +77,49 @@ scrollback, and socket IPC — no state inference.
 
 ## Configuration
 
-Set the classifier in `heimdall.toml`:
+Set the classifier in `heimdall.toml`. Two forms are supported:
+
+**String shorthand** (all built-in defaults for the classifier):
 
 ```toml
-classifier = "claude"    # or "simple" or "none"
-idle_threshold_ms = 3000
-debounce_ms = 200
+classifier = "simple"    # or "claude" or "none" (default: "simple")
 ```
 
-The `idle_threshold_ms` and `debounce_ms` values are passed to whichever
-classifier is selected. The `none` classifier ignores both.
+**Table form** (per-classifier parameters):
+
+```toml
+[classifier.simple]
+idle_threshold_ms = 3000
+
+# or
+
+[classifier.claude]
+idle_threshold_ms = 3000
+debounce_ms = 200
+
+# or
+
+[classifier.none]
+```
+
+Each classifier carries its own parameters:
+
+| Parameter | Classifiers | Default | Description |
+|---|---|---|---|
+| `idle_threshold_ms` | simple, claude | 3000 | Silence duration (ms) before transitioning to Idle |
+| `debounce_ms` | claude | 200 | Minimum time (ms) a non-idle state must persist before it's committed |
+
+The `none` classifier has no parameters — it always reports Idle.
+
+### CLI overrides
+
+All classifier parameters can be overridden on the command line:
+
+```bash
+hm run --id foo --classifier claude --idle-threshold-ms 5000 --debounce-ms 100 -- bash
+```
+
+When `--classifier` is given, a fresh classifier is created with the specified
+(or default) parameters. When only `--idle-threshold-ms` or `--debounce-ms`
+are given without `--classifier`, they override the corresponding parameter on
+whatever classifier the config file selected.

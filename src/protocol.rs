@@ -59,9 +59,53 @@ pub fn pack_status(pid: u32, idle_ms: u32, alive: bool, state: u8, state_ms: u32
     pack_frame(STATUS_RESP, &payload)
 }
 
+/// Pack a resize payload: `[cols: u16 BE][rows: u16 BE]`.
+pub fn pack_resize(cols: u16, rows: u16) -> [u8; 4] {
+    let mut payload = [0u8; 4];
+    payload[0..2].copy_from_slice(&cols.to_be_bytes());
+    payload[2..4].copy_from_slice(&rows.to_be_bytes());
+    payload
+}
+
 /// Pack an exit notification payload.
 pub fn pack_exit(code: i32) -> Bytes {
     pack_frame(EXIT, &code.to_be_bytes())
+}
+
+/// Parse a RESIZE frame payload into `(cols, rows)`.
+///
+/// Payload must be exactly 4 bytes per the protocol spec.
+pub fn parse_resize(payload: &[u8]) -> io::Result<(u16, u16)> {
+    if payload.len() != 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "RESIZE payload must be exactly 4 bytes, got {}",
+                payload.len()
+            ),
+        ));
+    }
+    let cols = u16::from_be_bytes([payload[0], payload[1]]);
+    let rows = u16::from_be_bytes([payload[2], payload[3]]);
+    Ok((cols, rows))
+}
+
+/// Parse an EXIT frame payload into the exit code.
+///
+/// Payload must be exactly 4 bytes per the protocol spec.
+pub fn parse_exit_code(payload: &[u8]) -> io::Result<i32> {
+    if payload.len() != 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "EXIT payload must be exactly 4 bytes, got {}",
+                payload.len()
+            ),
+        ));
+    }
+    Ok(i32::from_be_bytes([
+        payload[0], payload[1], payload[2], payload[3],
+    ]))
 }
 
 /// Maximum frame payload size (1 MB). Frames larger than this are rejected
@@ -74,7 +118,9 @@ pub const MAX_FRAME_SIZE: usize = 1 << 20;
 pub async fn read_frame<R: AsyncReadExt + Unpin>(reader: &mut R) -> io::Result<(u8, Bytes)> {
     let mut header = [0u8; 5];
     reader.read_exact(&mut header).await?;
+    // First byte is the message type.
     let msg_type = header[0];
+    // Length of the payload in bytes (big-endian).
     let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
     if len == 0 {
         return Ok((msg_type, Bytes::new()));
@@ -85,19 +131,147 @@ pub async fn read_frame<R: AsyncReadExt + Unpin>(reader: &mut R) -> io::Result<(
             format!("frame payload {len} bytes exceeds maximum {MAX_FRAME_SIZE}"),
         ));
     }
+    // allocate a buffer and read the payload, we already know the length from the header, `len`
     let mut payload = vec![0u8; len];
     reader.read_exact(&mut payload).await?;
     Ok((msg_type, Bytes::from(payload)))
 }
 
 /// Write one frame to an async writer.
+///
+/// Writes the 5-byte header and payload separately rather than allocating
+/// a combined buffer via `pack_frame`. Tokio's buffered writers coalesce
+/// these into a single syscall.
 pub async fn write_frame<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     msg_type: u8,
     payload: &[u8],
 ) -> io::Result<()> {
-    let frame = pack_frame(msg_type, payload);
-    writer.write_all(&frame).await
+    let len = payload.len() as u32;
+    let mut header = [0u8; 5];
+    header[0] = msg_type;
+    header[1..5].copy_from_slice(&len.to_be_bytes());
+    writer.write_all(&header).await?;
+    writer.write_all(payload).await
+}
+
+// -- Client session --
+
+use std::path::Path;
+use tokio::io::BufReader;
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+
+/// Client-side session: connected socket with mode-byte handshake complete.
+///
+/// For simple request-response commands, use [`send`](Self::send) and
+/// [`recv`](Self::recv). For long-lived connections (subscribe + select loop),
+/// access the raw `reader` and `writer` fields directly.
+pub struct Session {
+    pub reader: BufReader<OwnedReadHalf>,
+    pub writer: OwnedWriteHalf,
+}
+
+impl Session {
+    /// Connect to a session's Unix socket and perform the mode-byte handshake.
+    pub async fn connect(socket_path: &Path) -> io::Result<Self> {
+        let stream = tokio::net::UnixStream::connect(socket_path).await?;
+        let (read_half, writer) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+
+        let mut mode = [0u8; 1];
+        reader.read_exact(&mut mode).await?;
+        if mode[0] != MODE_BINARY {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "expected binary mode (0x{MODE_BINARY:02x}), got 0x{:02x}",
+                    mode[0]
+                ),
+            ));
+        }
+
+        Ok(Self { reader, writer })
+    }
+
+    /// Send a frame to the supervisor.
+    pub async fn send(&mut self, msg_type: u8, payload: &[u8]) -> io::Result<()> {
+        write_frame(&mut self.writer, msg_type, payload).await
+    }
+
+    /// Read one frame from the supervisor.
+    pub async fn recv(&mut self) -> io::Result<(u8, Bytes)> {
+        read_frame(&mut self.reader).await
+    }
+
+    /// Send a RESIZE frame.
+    pub async fn send_resize(&mut self, cols: u16, rows: u16) -> io::Result<()> {
+        self.send(RESIZE, &pack_resize(cols, rows)).await
+    }
+
+    /// Send a SUBSCRIBE frame to start receiving pty output.
+    pub async fn subscribe(&mut self) -> io::Result<()> {
+        self.send(SUBSCRIBE, &[]).await
+    }
+
+    /// Request a status response.
+    pub async fn send_status(&mut self) -> io::Result<()> {
+        self.send(STATUS, &[]).await
+    }
+
+    /// Send STATUS and parse the response into a [`StatusResponse`].
+    pub async fn recv_status(&mut self) -> io::Result<StatusResponse> {
+        self.send_status().await?;
+        let (msg_type, payload) = self.recv().await?;
+        if msg_type != STATUS_RESP {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("expected STATUS_RESP (0x{STATUS_RESP:02x}), got 0x{msg_type:02x}"),
+            ));
+        }
+        StatusResponse::parse(&payload)
+    }
+
+    /// Send a KILL frame to terminate the session.
+    pub async fn send_kill(&mut self) -> io::Result<()> {
+        self.send(KILL, &[]).await
+    }
+}
+
+/// Parsed status response from the supervisor.
+#[derive(Debug, Clone)]
+pub struct StatusResponse {
+    pub pid: u32,
+    pub idle_ms: u32,
+    pub alive: bool,
+    pub state: u8,
+    pub state_ms: u32,
+}
+
+impl StatusResponse {
+    /// Parse from a STATUS_RESP payload (minimum 14 bytes).
+    fn parse(payload: &[u8]) -> io::Result<Self> {
+        if payload.len() < 14 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "STATUS_RESP payload too short: {} bytes (need 14)",
+                    payload.len()
+                ),
+            ));
+        }
+        let pid = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        let idle_ms = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+        let alive = payload[8] != 0;
+        let state = payload[9];
+        let state_ms = u32::from_be_bytes([payload[10], payload[11], payload[12], payload[13]]);
+        Ok(Self {
+            pid,
+            idle_ms,
+            alive,
+            state,
+            state_ms,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -351,5 +525,151 @@ mod tests {
         assert_eq!(frame.len(), 5);
         assert_eq!(frame[0], STATUS);
         assert_eq!(&frame[1..5], &[0, 0, 0, 0]);
+    }
+
+    // -- Wire-level golden byte tests --
+    // These assert exact byte sequences to catch symmetric pack/parse bugs.
+    // If both sides have the same field-swap bug, round-trip tests pass
+    // but the wire format is silently wrong.
+
+    /// pack_frame produces exact wire bytes for a known input.
+    #[test]
+    fn pack_frame_golden_bytes() {
+        let frame = pack_frame(INPUT, b"\xDE\xAD");
+        // [type=0x01][len=0x00000002][payload=0xDEAD]
+        assert_eq!(frame.as_ref(), &[0x01, 0x00, 0x00, 0x00, 0x02, 0xDE, 0xAD]);
+    }
+
+    /// pack_exit produces exact 9-byte wire format.
+    #[test]
+    fn pack_exit_golden_bytes() {
+        let frame = pack_exit(137); // 128 + SIGKILL(9)
+        // [type=0x83][len=0x00000004][code=0x00000089]
+        assert_eq!(
+            frame.as_ref(),
+            &[0x83, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x89]
+        );
+    }
+
+    /// pack_exit with negative code produces correct two's complement bytes.
+    #[test]
+    fn pack_exit_negative_golden_bytes() {
+        let frame = pack_exit(-1);
+        // [type=0x83][len=0x00000004][code=0xFFFFFFFF]
+        assert_eq!(
+            frame.as_ref(),
+            &[0x83, 0x00, 0x00, 0x00, 0x04, 0xFF, 0xFF, 0xFF, 0xFF]
+        );
+    }
+
+    /// pack_resize produces exact 4-byte payload layout.
+    #[test]
+    fn pack_resize_golden_bytes() {
+        let payload = pack_resize(120, 40);
+        // [cols=0x0078][rows=0x0028]
+        assert_eq!(payload, [0x00, 0x78, 0x00, 0x28]);
+    }
+
+    /// pack_status produces exact 20-byte wire format with every field at a known offset.
+    #[test]
+    fn pack_status_golden_bytes() {
+        let frame = pack_status(
+            0x0000_1234, // pid
+            0x0000_0042, // idle_ms = 66
+            true,        // alive
+            0x02,        // state = streaming
+            0x0000_04D2, // state_ms = 1234
+        );
+        assert_eq!(frame.len(), 20);
+        #[rustfmt::skip]
+        let expected: [u8; 20] = [
+            0x82,                         // type = STATUS_RESP
+            0x00, 0x00, 0x00, 0x0F,       // len = 15
+            0x00, 0x00, 0x12, 0x34,       // pid
+            0x00, 0x00, 0x00, 0x42,       // idle_ms
+            0x01,                         // alive
+            0x02,                         // state
+            0x00, 0x00, 0x04, 0xD2,       // state_ms
+            0x00,                         // reserved
+        ];
+        assert_eq!(frame.as_ref(), &expected);
+    }
+
+    /// parse_resize against hand-constructed bytes (not from pack_resize).
+    #[test]
+    fn parse_resize_from_raw_bytes() {
+        // 80 cols = 0x0050, 24 rows = 0x0018
+        let raw = [0x00, 0x50, 0x00, 0x18];
+        let (cols, rows) = parse_resize(&raw).unwrap();
+        assert_eq!(cols, 80);
+        assert_eq!(rows, 24);
+    }
+
+    /// parse_exit_code against hand-constructed bytes (not from pack_exit).
+    #[test]
+    fn parse_exit_code_from_raw_bytes() {
+        // exit code 42 = 0x0000002A
+        let raw = [0x00, 0x00, 0x00, 0x2A];
+        let code = parse_exit_code(&raw).unwrap();
+        assert_eq!(code, 42);
+    }
+
+    /// parse_exit_code with signal death (negative via two's complement).
+    #[test]
+    fn parse_exit_code_negative_from_raw_bytes() {
+        // -9 in two's complement = 0xFFFFFFF7
+        let raw = [0xFF, 0xFF, 0xFF, 0xF7];
+        let code = parse_exit_code(&raw).unwrap();
+        assert_eq!(code, -9);
+    }
+
+    /// parse_resize rejects short payload.
+    #[test]
+    fn parse_resize_rejects_short() {
+        assert!(parse_resize(&[0x00, 0x50]).is_err());
+        assert!(parse_resize(&[]).is_err());
+    }
+
+    /// parse_resize rejects oversized payload (spec says exactly 4).
+    #[test]
+    fn parse_resize_rejects_oversized() {
+        assert!(parse_resize(&[0x00, 0x50, 0x00, 0x18, 0xFF]).is_err());
+    }
+
+    /// parse_exit_code rejects short payload.
+    #[test]
+    fn parse_exit_code_rejects_short() {
+        assert!(parse_exit_code(&[0x00, 0x00]).is_err());
+        assert!(parse_exit_code(&[]).is_err());
+    }
+
+    /// parse_exit_code rejects oversized payload (spec says exactly 4).
+    #[test]
+    fn parse_exit_code_rejects_oversized() {
+        assert!(parse_exit_code(&[0x00, 0x00, 0x00, 0x2A, 0xFF]).is_err());
+    }
+
+    /// Dead process golden bytes: alive=0, state=0xFF at correct offsets.
+    #[test]
+    fn pack_status_dead_golden_bytes() {
+        let frame = pack_status(
+            0x0000_002A, // pid = 42
+            0x0000_270F, // idle_ms = 9999
+            false,       // alive = dead
+            0xFF,        // state = Dead
+            0x0000_01F4, // state_ms = 500
+        );
+        #[rustfmt::skip]
+        let expected: [u8; 20] = [
+            0x82,                         // type = STATUS_RESP
+            0x00, 0x00, 0x00, 0x0F,       // len = 15
+            0x00, 0x00, 0x00, 0x2A,       // pid = 42
+            0x00, 0x00, 0x27, 0x0F,       // idle_ms = 9999
+            0x00,                         // alive = false
+            0xFF,                         // state = Dead
+            0x00, 0x00, 0x01, 0xF4,       // state_ms = 500
+            0x00,                         // reserved
+        ];
+        assert_eq!(frame.as_ref(), &expected);
     }
 }

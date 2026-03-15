@@ -90,8 +90,8 @@ fn duplicate_session_rejected_when_alive() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("already running"),
-        "stderr should mention 'already running': {stderr}"
+        stderr.contains("already running") || stderr.contains("is locked by"),
+        "stderr should mention session conflict: {stderr}"
     );
 
     // Clean up first session.
@@ -224,11 +224,24 @@ fn status_over_socket() {
     let mut payload = [0u8; 15];
     stream.read_exact(&mut payload).unwrap();
 
-    // Parse fields.
+    // Parse fields: [pid: u32][idle_ms: u32][alive: u8][state: u8][state_ms: u32]
     let pid = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    let idle_ms = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
     let alive = payload[8];
+    let state = payload[9];
+    let state_ms = u32::from_be_bytes([payload[10], payload[11], payload[12], payload[13]]);
     assert!(pid > 0, "pid should be nonzero");
     assert_eq!(alive, 1, "alive should be 1");
+    assert!(
+        idle_ms < 5000,
+        "idle_ms should be small for a just-started session, got {idle_ms}"
+    );
+    // State: 0x00=idle, 0x01=thinking, 0x02=streaming, 0x03=tool_use, 0x04=active.
+    assert!(
+        state <= 0x04,
+        "state should be valid (0x00-0x04), got {state:#x}"
+    );
+    let _ = state_ms; // state_ms is valid at any value
 
     let _ = child.kill();
     let _ = child.wait();
@@ -278,8 +291,7 @@ fn kill_subcommand_terminates_session() {
     assert!(kill_output.status.success(), "kill command should succeed");
 
     // The supervisor should exit within a few seconds.
-    let status = child.wait().expect("failed to wait for child");
-    let _ = status;
+    let _status = child.wait().expect("failed to wait for child");
 
     // Socket and PID files should be cleaned up after kill.
     let pid_path = socket_dir.join(format!("{session_id}.pid"));
@@ -474,6 +486,15 @@ fn status_works_after_subscriber_disconnect() {
             header[0], 0x82,
             "should get STATUS_RESP after subscriber disconnect"
         );
+        let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]);
+        assert_eq!(len, 15, "STATUS_RESP payload must be 15 bytes");
+
+        let mut payload = [0u8; 15];
+        stream.read_exact(&mut payload).unwrap();
+        let pid = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        let alive = payload[8];
+        assert!(pid > 0, "pid should be nonzero after subscriber disconnect");
+        assert_eq!(alive, 1, "alive should be 1 after subscriber disconnect");
     }
 
     let _ = child.kill();
@@ -642,13 +663,24 @@ fn concurrent_status_queries() {
 
                 let mut mode = [0u8; 1];
                 stream.read_exact(&mut mode).unwrap();
+                assert_eq!(mode[0], 0x00, "mode byte should be MODE_BINARY");
 
                 let status_frame: [u8; 5] = [0x03, 0, 0, 0, 0];
                 stream.write_all(&status_frame).unwrap();
 
                 let mut header = [0u8; 5];
                 stream.read_exact(&mut header).unwrap();
-                header[0] == 0x82 // STATUS_RESP
+                assert_eq!(header[0], 0x82, "expected STATUS_RESP");
+                let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]);
+                assert_eq!(len, 15, "STATUS_RESP payload must be 15 bytes");
+
+                let mut payload = [0u8; 15];
+                stream.read_exact(&mut payload).unwrap();
+                let pid = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                let alive = payload[8];
+                assert!(pid > 0, "pid should be nonzero");
+                assert_eq!(alive, 1, "alive should be 1");
+                true
             })
         })
         .collect();
@@ -794,18 +826,20 @@ fn subscriber_receives_exit_frame_on_child_exit() {
         let msg_type = header[0];
         let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
         let mut payload = vec![0u8; len];
-        if len > 0 {
-            if stream.read_exact(&mut payload).is_err() {
-                break;
-            }
+        if len > 0 && stream.read_exact(&mut payload).is_err() {
+            break;
         }
         if msg_type == 0x83 {
             got_exit = true;
-            if payload.len() >= 4 {
-                exit_code = Some(i32::from_be_bytes([
-                    payload[0], payload[1], payload[2], payload[3],
-                ]));
-            }
+            assert_eq!(
+                payload.len(),
+                4,
+                "EXIT frame payload must be exactly 4 bytes, got {}",
+                payload.len()
+            );
+            exit_code = Some(i32::from_be_bytes([
+                payload[0], payload[1], payload[2], payload[3],
+            ]));
             break;
         }
     }
@@ -948,6 +982,15 @@ fn partial_frame_disconnect_does_not_crash_supervisor() {
             header[0], 0x82,
             "should get STATUS_RESP after partial frame client"
         );
+        let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]);
+        assert_eq!(len, 15, "STATUS_RESP payload must be 15 bytes");
+
+        let mut payload = [0u8; 15];
+        stream.read_exact(&mut payload).unwrap();
+        let pid = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        let alive = payload[8];
+        assert!(pid > 0, "pid should be nonzero after partial frame client");
+        assert_eq!(alive, 1, "alive should be 1 after partial frame client");
     }
 
     let _ = child.kill();
@@ -1049,6 +1092,179 @@ fn list_cleans_stale_socket_and_pid_files() {
 
     assert!(!sock.exists(), "stale .sock should be cleaned up by ls");
     assert!(!pid.exists(), "stale .pid should be cleaned up by ls");
+}
+
+// -- Clean subcommand --
+
+/// `hm clean --force` removes orphaned .log files older than the retention window.
+#[test]
+fn clean_removes_old_orphan_logs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket_dir = tmp.path().to_path_buf();
+    std::fs::create_dir_all(&socket_dir).unwrap();
+
+    // Create an old orphaned log (no .sock or .pid).
+    let old_log = socket_dir.join("dead-session.log");
+    std::fs::write(&old_log, "some log output").unwrap();
+
+    // Backdate the file to 2 days ago.
+    let two_days_ago = filetime::FileTime::from_system_time(
+        std::time::SystemTime::now() - Duration::from_secs(2 * 86400),
+    );
+    filetime::set_file_mtime(&old_log, two_days_ago).unwrap();
+
+    assert!(old_log.exists());
+
+    let output = Command::new(hm_bin())
+        .args([
+            "clean",
+            "--socket-dir",
+            socket_dir.to_str().unwrap(),
+            "--older-than",
+            "24h",
+            "--force",
+        ])
+        .output()
+        .expect("failed to run clean");
+
+    assert!(output.status.success(), "clean should succeed");
+    assert!(!old_log.exists(), "old orphan log should be removed");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Cleaned 1 log file"),
+        "should report cleaning: {stdout}"
+    );
+}
+
+/// `hm clean --force` preserves logs within the retention window.
+#[test]
+fn clean_preserves_young_logs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket_dir = tmp.path().to_path_buf();
+    std::fs::create_dir_all(&socket_dir).unwrap();
+
+    // Create a fresh orphaned log (just created, well within 24h).
+    let fresh_log = socket_dir.join("recent-session.log");
+    std::fs::write(&fresh_log, "recent log output").unwrap();
+
+    let output = Command::new(hm_bin())
+        .args([
+            "clean",
+            "--socket-dir",
+            socket_dir.to_str().unwrap(),
+            "--older-than",
+            "24h",
+            "--force",
+        ])
+        .output()
+        .expect("failed to run clean");
+
+    assert!(output.status.success());
+    assert!(fresh_log.exists(), "young log should be preserved");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Nothing to clean"),
+        "should report nothing to clean: {stdout}"
+    );
+}
+
+/// `hm clean` without --force is dry-run by default.
+#[test]
+fn clean_default_is_dry_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket_dir = tmp.path().to_path_buf();
+    std::fs::create_dir_all(&socket_dir).unwrap();
+
+    let old_log = socket_dir.join("old-session.log");
+    std::fs::write(&old_log, "old log").unwrap();
+
+    let two_days_ago = filetime::FileTime::from_system_time(
+        std::time::SystemTime::now() - Duration::from_secs(2 * 86400),
+    );
+    filetime::set_file_mtime(&old_log, two_days_ago).unwrap();
+
+    let output = Command::new(hm_bin())
+        .args([
+            "clean",
+            "--socket-dir",
+            socket_dir.to_str().unwrap(),
+            "--older-than",
+            "24h",
+        ])
+        .output()
+        .expect("failed to run clean");
+
+    assert!(output.status.success());
+    assert!(
+        old_log.exists(),
+        "default (dry-run) should not delete files"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("would remove"),
+        "should show what would be removed: {stdout}"
+    );
+}
+
+/// `hm clean` skips logs belonging to live sessions.
+#[test]
+fn clean_preserves_live_session_logs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket_dir = tmp.path().to_path_buf();
+    let session_id = "clean-live";
+    let socket_path = socket_dir.join(format!("{session_id}.sock"));
+
+    // Start a live session.
+    let mut child = Command::new(hm_bin())
+        .args([
+            "run",
+            "--detach",
+            "--id",
+            session_id,
+            "--socket-dir",
+            socket_dir.to_str().unwrap(),
+            "--",
+            "sleep",
+            "30",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+
+    assert!(wait_for_socket(&socket_path, Duration::from_secs(5)));
+
+    // The log file exists and belongs to a live session.
+    let log_path = socket_dir.join(format!("{session_id}.log"));
+
+    // Backdate it so it would be cleaned if orphaned.
+    if log_path.exists() {
+        let old = filetime::FileTime::from_system_time(
+            std::time::SystemTime::now() - Duration::from_secs(2 * 86400),
+        );
+        filetime::set_file_mtime(&log_path, old).unwrap();
+    }
+
+    let output = Command::new(hm_bin())
+        .args([
+            "clean",
+            "--socket-dir",
+            socket_dir.to_str().unwrap(),
+            "--older-than",
+            "1s",
+            "--force",
+        ])
+        .output()
+        .expect("failed to run clean");
+
+    assert!(output.status.success());
+    assert!(log_path.exists(), "live session log should not be removed");
+
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 // -- Tests that would have caught bugs found by code review --
@@ -1190,6 +1406,20 @@ fn status_works_with_output_producing_children() {
             .read_exact(&mut header)
             .unwrap_or_else(|e| panic!("{session_id}: timed out reading status response: {e}"));
         assert_eq!(header[0], 0x82, "{session_id}: should get STATUS_RESP");
+        let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]);
+        assert_eq!(
+            len, 15,
+            "{session_id}: STATUS_RESP payload must be 15 bytes"
+        );
+
+        let mut payload = [0u8; 15];
+        stream
+            .read_exact(&mut payload)
+            .unwrap_or_else(|e| panic!("{session_id}: failed to read status payload: {e}"));
+        let pid = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        let alive = payload[8];
+        assert!(pid > 0, "{session_id}: pid should be nonzero");
+        assert_eq!(alive, 1, "{session_id}: alive should be 1");
 
         let _ = child.kill();
         let _ = child.wait();
@@ -1343,6 +1573,26 @@ fn oversized_frame_over_socket_rejected() {
         assert_eq!(
             resp_header[0], 0x82,
             "supervisor should still respond after rejecting oversized frame"
+        );
+        let len = u32::from_be_bytes([
+            resp_header[1],
+            resp_header[2],
+            resp_header[3],
+            resp_header[4],
+        ]);
+        assert_eq!(len, 15, "STATUS_RESP payload must be 15 bytes");
+
+        let mut payload = [0u8; 15];
+        stream.read_exact(&mut payload).unwrap();
+        let pid = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        let alive = payload[8];
+        assert!(
+            pid > 0,
+            "pid should be nonzero after oversized frame rejection"
+        );
+        assert_eq!(
+            alive, 1,
+            "alive should be 1 after oversized frame rejection"
         );
     }
 
@@ -1621,10 +1871,8 @@ fn subscribe_receives_scrollback() {
         let msg_type = header[0];
         let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
         let mut payload = vec![0u8; len];
-        if len > 0 {
-            if stream.read_exact(&mut payload).is_err() {
-                break;
-            }
+        if len > 0 && stream.read_exact(&mut payload).is_err() {
+            break;
         }
         if msg_type == 0x81 {
             output_data.extend_from_slice(&payload);
@@ -1703,10 +1951,8 @@ fn scrollback_eviction() {
         let msg_type = header[0];
         let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
         let mut payload = vec![0u8; len];
-        if len > 0 {
-            if stream.read_exact(&mut payload).is_err() {
-                break;
-            }
+        if len > 0 && stream.read_exact(&mut payload).is_err() {
+            break;
         }
         if msg_type == 0x81 {
             total_bytes += len;
@@ -1780,10 +2026,8 @@ fn multiple_subscribers_see_same_output() {
             let msg_type = header[0];
             let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
             let mut payload = vec![0u8; len];
-            if len > 0 {
-                if stream.read_exact(&mut payload).is_err() {
-                    break;
-                }
+            if len > 0 && stream.read_exact(&mut payload).is_err() {
+                break;
             }
             if msg_type == 0x81 {
                 output_data.extend_from_slice(&payload);
@@ -1873,10 +2117,8 @@ fn input_round_trip() {
         let msg_type = header[0];
         let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
         let mut payload = vec![0u8; len];
-        if len > 0 {
-            if stream.read_exact(&mut payload).is_err() {
-                break;
-            }
+        if len > 0 && stream.read_exact(&mut payload).is_err() {
+            break;
         }
         if msg_type == 0x81 {
             output_data.extend_from_slice(&payload);
@@ -1943,6 +2185,7 @@ fn kill_frame_sends_sigterm() {
 
     // Read frames until EXIT (0x83) or timeout.
     let mut got_exit = false;
+    let mut exit_code: Option<i32> = None;
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_secs(5) {
         let mut header = [0u8; 5];
@@ -1953,18 +2196,30 @@ fn kill_frame_sends_sigterm() {
         let msg_type = header[0];
         let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
         let mut payload = vec![0u8; len];
-        if len > 0 {
-            if stream.read_exact(&mut payload).is_err() {
-                break;
-            }
+        if len > 0 && stream.read_exact(&mut payload).is_err() {
+            break;
         }
         if msg_type == 0x83 {
             got_exit = true;
+            assert_eq!(
+                payload.len(),
+                4,
+                "EXIT frame payload must be exactly 4 bytes"
+            );
+            exit_code = Some(i32::from_be_bytes([
+                payload[0], payload[1], payload[2], payload[3],
+            ]));
             break;
         }
     }
 
     assert!(got_exit, "should receive EXIT frame after sending KILL");
+    // SIGTERM kills sleep, so exit code should be non-zero (signal death).
+    assert!(
+        exit_code.unwrap() != 0,
+        "exit code after KILL should be non-zero (signal death), got {:?}",
+        exit_code
+    );
 
     let _ = child.wait();
 }
@@ -2113,10 +2368,8 @@ fn custom_session_env_var() {
         let msg_type = header[0];
         let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
         let mut payload = vec![0u8; len];
-        if len > 0 {
-            if stream.read_exact(&mut payload).is_err() {
-                break;
-            }
+        if len > 0 && stream.read_exact(&mut payload).is_err() {
+            break;
         }
         if msg_type == 0x81 {
             output_data.extend_from_slice(&payload);
@@ -2198,10 +2451,8 @@ value = "integ_test_value_42"
         let msg_type = header[0];
         let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
         let mut payload = vec![0u8; len];
-        if len > 0 {
-            if stream.read_exact(&mut payload).is_err() {
-                break;
-            }
+        if len > 0 && stream.read_exact(&mut payload).is_err() {
+            break;
         }
         if msg_type == 0x81 {
             output_data.extend_from_slice(&payload);
@@ -2275,10 +2526,8 @@ fn workdir_applied_to_child() {
         let msg_type = header[0];
         let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
         let mut payload = vec![0u8; len];
-        if len > 0 {
-            if stream.read_exact(&mut payload).is_err() {
-                break;
-            }
+        if len > 0 && stream.read_exact(&mut payload).is_err() {
+            break;
         }
         if msg_type == 0x81 {
             output_data.extend_from_slice(&payload);
@@ -2427,10 +2676,8 @@ fn binary_data_through_pty() {
         let msg_type = header[0];
         let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
         let mut payload = vec![0u8; len];
-        if len > 0 {
-            if stream.read_exact(&mut payload).is_err() {
-                break;
-            }
+        if len > 0 && stream.read_exact(&mut payload).is_err() {
+            break;
         }
         if msg_type == 0x81 {
             got_output = true;
@@ -2524,6 +2771,8 @@ fn zero_size_terminal() {
 
     let mut payload = [0u8; 15];
     stream.read_exact(&mut payload).unwrap();
+    let pid = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    assert!(pid > 0, "pid should be nonzero with zero-size terminal");
     assert_eq!(payload[8], 1, "should be alive with zero-size terminal");
 
     let _ = child.kill();
@@ -2581,7 +2830,11 @@ fn idle_ms_counter() {
     let mut payload = [0u8; 15];
     stream.read_exact(&mut payload).unwrap();
 
+    let pid = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
     let idle_ms = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+    let alive = payload[8];
+    assert!(pid > 0, "pid should be nonzero");
+    assert_eq!(alive, 1, "should be alive");
     assert!(
         idle_ms >= 1500,
         "idle_ms should be >= 1500 after 2s wait, got {idle_ms}"
@@ -2622,20 +2875,25 @@ fn supervisor_sigterm_graceful_shutdown() {
 
     assert!(wait_for_socket(&socket_path, Duration::from_secs(5)));
 
-    // Read supervisor PID from the PID file.
-    let pid_str = std::fs::read_to_string(&pid_path)
-        .expect("failed to read PID file")
+    // Read supervisor PID from line 1 of the PID file.
+    let pid_contents = std::fs::read_to_string(&pid_path).expect("failed to read PID file");
+    let supervisor_pid: i32 = pid_contents
+        .lines()
+        .next()
+        .expect("PID file should have at least one line")
         .trim()
-        .to_string();
-    let supervisor_pid: i32 = pid_str.parse().expect("PID file should contain a number");
+        .parse()
+        .expect("PID file line 1 should be the supervisor PID");
 
     // Send SIGTERM to the supervisor.
     signal::kill(Pid::from_raw(supervisor_pid), Signal::SIGTERM).expect("failed to send SIGTERM");
 
     // Wait for socket to disappear (graceful shutdown).
+    // The supervisor sends SIGTERM to the child, waits up to 5s (SIGKILL_GRACE),
+    // then SIGKILLs. Allow enough time for the full grace period + cleanup.
     let start = std::time::Instant::now();
     let mut cleaned_up = false;
-    while start.elapsed() < Duration::from_secs(5) {
+    while start.elapsed() < Duration::from_secs(10) {
         if !socket_path.exists() {
             cleaned_up = true;
             break;
@@ -2644,6 +2902,10 @@ fn supervisor_sigterm_graceful_shutdown() {
     }
 
     assert!(cleaned_up, "socket file should be cleaned up after SIGTERM");
+    assert!(
+        !pid_path.exists(),
+        "PID file should be cleaned up after SIGTERM"
+    );
 
     let _ = child.wait();
 }
@@ -2711,10 +2973,8 @@ fn read_output_frames(stream: &mut UnixStream, timeout: Duration) -> (Vec<u8>, b
         let msg_type = header[0];
         let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
         let mut payload = vec![0u8; len];
-        if len > 0 {
-            if stream.read_exact(&mut payload).is_err() {
-                break;
-            }
+        if len > 0 && stream.read_exact(&mut payload).is_err() {
+            break;
         }
         if msg_type == 0x81 {
             output_data.extend_from_slice(&payload);
@@ -2828,7 +3088,7 @@ fn large_paste_burst() {
 
     // Build large input: "echo " + 4000 'A's + "\r"
     let mut input_data = b"echo ".to_vec();
-    input_data.extend(std::iter::repeat(b'A').take(4000));
+    input_data.extend(std::iter::repeat_n(b'A', 4000));
     input_data.push(b'\r');
     let frame = build_input_frame(&input_data);
     stream.write_all(&frame).unwrap();
@@ -2920,10 +3180,8 @@ fn ctrl_c_forwarded_not_exit() {
         let msg_type = header[0];
         let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
         let mut payload = vec![0u8; len];
-        if len > 0 {
-            if stream.read_exact(&mut payload).is_err() {
-                break;
-            }
+        if len > 0 && stream.read_exact(&mut payload).is_err() {
+            break;
         }
         if msg_type == 0x81 {
             output_data.extend_from_slice(&payload);
@@ -2953,10 +3211,8 @@ fn ctrl_c_forwarded_not_exit() {
         let msg_type = header[0];
         let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
         let mut payload = vec![0u8; len];
-        if len > 0 {
-            if stream.read_exact(&mut payload).is_err() {
-                break;
-            }
+        if len > 0 && stream.read_exact(&mut payload).is_err() {
+            break;
         }
         if msg_type == 0x81 {
             output_data.extend_from_slice(&payload);
@@ -3236,10 +3492,8 @@ fn input_after_subscribe() {
         let msg_type = header[0];
         let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
         let mut payload = vec![0u8; len];
-        if len > 0 {
-            if stream.read_exact(&mut payload).is_err() {
-                break;
-            }
+        if len > 0 && stream.read_exact(&mut payload).is_err() {
+            break;
         }
         if msg_type == 0x81 {
             output_data.extend_from_slice(&payload);

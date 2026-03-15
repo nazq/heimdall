@@ -54,36 +54,56 @@ impl ClaudeClassifier {
         }
 
         // Check for tool use pattern: pause > 200ms followed by burst > 1KB.
+        // Iterate pairs directly from the deque — no Vec allocation needed.
         if self.window.len() >= 2 {
-            let events: Vec<&OutputEvent> = self.window.iter().rev().take(5).collect();
-            for pair in events.windows(2) {
-                let newer = pair[0];
-                let older = pair[1];
-                let gap = newer.timestamp_ms.saturating_sub(older.timestamp_ms);
-                if gap > 200 && newer.byte_count > 1024 {
-                    return ProcessState::ToolUse;
+            let skip = self.window.len().saturating_sub(5);
+            let mut iter = self.window.iter().skip(skip);
+            if let Some(mut prev) = iter.next() {
+                for event in iter {
+                    let gap = event.timestamp_ms.saturating_sub(prev.timestamp_ms);
+                    if gap > 200 && event.byte_count > 1024 {
+                        return ProcessState::ToolUse;
+                    }
+                    prev = event;
                 }
             }
         }
 
         // Analyse last 10 bursts for spinner vs streaming.
-        let recent: Vec<&OutputEvent> = self.window.iter().rev().take(10).collect();
-        if recent.len() >= 5 {
-            let sizes: Vec<f64> = recent.iter().map(|e| e.byte_count as f64).collect();
-            let mean_size = sizes.iter().sum::<f64>() / sizes.len() as f64;
-            let variance =
-                sizes.iter().map(|s| (s - mean_size).powi(2)).sum::<f64>() / sizes.len() as f64;
-            let stddev = variance.sqrt();
+        // Compute statistics in a single pass — no Vec allocations.
+        let skip = self.window.len().saturating_sub(10);
+        let recent_count = self.window.len() - skip;
+        if recent_count >= 5 {
+            // Single pass: accumulate size sum, size sum-of-squares, gap sum.
+            let mut size_sum = 0.0_f64;
+            let mut size_sq_sum = 0.0_f64;
+            let mut gap_sum = 0.0_f64;
+            let mut gap_count = 0u32;
+            let mut prev_ts = 0u64;
+            let mut first = true;
 
-            // Compute inter-burst gaps.
-            let gaps: Vec<f64> = recent
-                .windows(2)
-                .map(|pair| pair[0].timestamp_ms.saturating_sub(pair[1].timestamp_ms) as f64)
-                .collect();
-            let mean_gap = if gaps.is_empty() {
-                0.0
+            for event in self.window.iter().skip(skip) {
+                let s = event.byte_count as f64;
+                size_sum += s;
+                size_sq_sum += s * s;
+                if !first {
+                    gap_sum += event.timestamp_ms.saturating_sub(prev_ts) as f64;
+                    gap_count += 1;
+                }
+                prev_ts = event.timestamp_ms;
+                first = false;
+            }
+
+            let n = recent_count as f64;
+            let mean_size = size_sum / n;
+            // Var = E[X^2] - E[X]^2 (numerically stable enough for our ranges).
+            let variance = (size_sq_sum / n) - (mean_size * mean_size);
+            let stddev = if variance > 0.0 { variance.sqrt() } else { 0.0 };
+
+            let mean_gap = if gap_count > 0 {
+                gap_sum / gap_count as f64
             } else {
-                gaps.iter().sum::<f64>() / gaps.len() as f64
+                0.0
             };
 
             // Spinner: uniform small bursts (40-120 bytes), regular intervals (30-200ms).

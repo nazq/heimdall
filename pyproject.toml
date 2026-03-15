@@ -1,0 +1,16 @@
+[project]
+name = "heimdall-tests"
+version = "0.1.0"
+description = "Python integration tests for heimdall"
+requires-python = ">=3.13"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "pexpect>=4.9",
+    "pytest>=8",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
